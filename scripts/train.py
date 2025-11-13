@@ -32,7 +32,7 @@ def main():
     logger = __import__('loguru').logger
     logger.info(f"Project: {config.project_name}")
     logger.info(f"Experiment: {config.experiment_name}")
-    logger.info(f"Config: {config.to_dict()}")
+    logger.info(f"Config: {config.from_dict()}")
     
     # Load model and tokenizer
     model, tokenizer = load_model_and_tokenizer(config)
