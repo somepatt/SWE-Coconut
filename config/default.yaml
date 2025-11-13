@@ -30,7 +30,7 @@ data:
   split: "train"
   max_seq_length: 2048
   max_prompt_length: 1024
-  batch_size: 16
+  batch_size: 8
   num_workers: 4
   gradient_accumulation_steps: 1
   cache_dir: "./data_cache"
