@@ -28,9 +28,9 @@ model:
 data:
   dataset_name: "SWE-bench/SWE-smith"
   split: "train"
-  max_seq_length: 1024
-  max_prompt_length: 512
-  batch_size: 2
+  max_seq_length: 2048
+  max_prompt_length: 1024
+  batch_size: 16
   num_workers: 4
   gradient_accumulation_steps: 1
   cache_dir: "./data_cache"
@@ -65,7 +65,7 @@ optimizer:
   warmup_steps: 100
 
 monitoring:
-  use_wandb: true
+  use_wandb: false
   wandb_project: "coconut-code"
   wandb_entity: null
   log_model: false

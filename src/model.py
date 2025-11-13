@@ -44,6 +44,7 @@ class CoconutModel(nn.Module):
             device_map=self.config.model.device_map,
             trust_remote_code=self.config.model.trust_remote_code,
             torch_dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2"
         )
         
         self.logger.info(f"Model loaded: {model.config.model_type}")
