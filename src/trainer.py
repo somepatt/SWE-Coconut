@@ -121,24 +121,22 @@ class CoconutTrainer:
         )
     
     def _compute_loss(self, batch: Dict, stage: int) -> torch.Tensor:
-        """
-        Compute COCONUT loss for given stage.
+        """Compute COCONUT loss with stage-aware latent reasoning"""
         
-        Stage 0: Full language-based CoT (no latent)
-        Stage N: Blend of latent reasoning and language
-        """
         input_ids = batch['input_ids']
         loss_mask = batch['loss_mask']
         attention_mask = batch['attention_mask']
         
-        # Forward pass
+        # ✅ Forward pass с stage!
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            labels=input_ids,
             stage=stage,
         )
         
-        logits = outputs.logits
+        logits = outputs['logits']
+        loss_raw = outputs['loss']
         
         # Shift for next token prediction
         shift_logits = logits[..., :-1, :].contiguous()
@@ -162,7 +160,7 @@ class CoconutTrainer:
         loss = loss / self.config.data.gradient_accumulation_steps
         
         return loss
-    
+        
     def _save_checkpoint(self, stage: int, step: int):
         """Save model checkpoint"""
         checkpoint_dir = Path(self.config.output_dir) / f"stage_{stage}" / f"step_{step}"
