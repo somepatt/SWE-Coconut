@@ -22,6 +22,8 @@ from utils import set_seed, setup_directories, get_device
 def main():
     # Load config
     config = load_config("config/default.yaml")
+    import os
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     
     # Setup
     setup_logger(config.output_dir, experiment_name=config.experiment_name)
