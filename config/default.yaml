@@ -1,0 +1,77 @@
+project_name: "coconut-code-llm"
+experiment_name: "swe-smith-qwen3"
+output_dir: "./outputs"
+seed: 42
+
+model:
+  name: "Qwen/Qwen3-0.6B"
+  dtype: "bfloat16"
+  device_map: "auto"
+  trust_remote_code: true
+  
+  # Quantization
+  use_quantization: true
+  quantization:
+    load_in_4bit: true
+    bnb_4bit_quant_type: "nf4"
+    bnb_4bit_compute_dtype: "bfloat16"
+    bnb_4bit_use_double_quant: true
+
+  # LoRA
+  use_lora: true
+  lora:
+    r: 16
+    lora_alpha: 32
+    target_modules: ["q_proj", "v_proj"]
+    lora_dropout: 0.05
+
+data:
+  dataset_name: "SWE-bench/SWE-smith"
+  split: "train"
+  max_seq_length: 1024
+  max_prompt_length: 512
+  batch_size: 2
+  num_workers: 4
+  gradient_accumulation_steps: 1
+  cache_dir: "./data_cache"
+
+training:
+  # COCONUT stages
+  num_stages: 3
+  epoch_per_stage: 1
+  
+  # Stage ratios: какую часть CoT шагов заменить на латентные
+  # stage 0: 0% - только language tokens
+  # stage 1: 33% - 1/3 латентных, 2/3 language
+  # stage 2: 66% - 2/3 латентных, 1/3 language
+  # stage 3: 100% - все латентные
+  
+  latent_dim: 256  # Размерность латентного пространства
+  continuous_thought_steps: 4  # Кол-во латентных шагов
+  
+  warmup_steps: 100
+  num_training_steps: 5000
+  logging_steps: 10
+  save_steps: 500
+  eval_steps: 1000
+
+optimizer:
+  name: "adamw"
+  lr: 5e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  max_grad_norm: 1.0
+  warmup_steps: 100
+
+monitoring:
+  use_wandb: true
+  wandb_project: "coconut-code"
+  wandb_entity: null
+  log_model: false
+
+checkpoint:
+  save_strategy: "steps"
+  save_steps: 500
+  resume_from_checkpoint: null
+  load_best_model_at_end: true
