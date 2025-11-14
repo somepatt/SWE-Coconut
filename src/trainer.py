@@ -123,38 +123,43 @@ class CoconutTrainer:
     def _compute_loss(self, batch: Dict, stage: int) -> torch.Tensor:
         """Compute COCONUT loss with stage-aware latent reasoning"""
         
+        # 1. Получаем 'labels' из батча, а не 'loss_mask'
         input_ids = batch['input_ids']
-        loss_mask = batch['loss_mask']
         attention_mask = batch['attention_mask']
-        
-        # ✅ Forward pass с stage!
+        labels = batch['labels'] 
+        position_ids = batch.get('position_ids', None) # .get для безопасности
+
+        # ✅ 2. Делаем forward pass
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            labels=input_ids,
+            position_ids=position_ids, 
         )
         
         logits = outputs['logits']
         
-        # Shift for next token prediction
+        # ✅ 3. Сдвигаем logits и labels для "next token prediction"
+        # Logits: (batch, seq_len, vocab_size) -> (batch, seq_len-1, vocab_size)
+        # Labels: (batch, seq_len) -> (batch, seq_len-1)
         shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = input_ids[..., 1:].contiguous()
-        shift_mask = loss_mask[..., 1:].contiguous()
+        shift_labels = labels[..., 1:].contiguous() # Используем 'labels', а не 'input_ids'
         
-        # Compute cross entropy loss
+        # ✅ 4. Считаем loss
+        # F.cross_entropy *автоматически* проигнорирует все токены, 
+        # где shift_labels == -100 (это стандартное поведение).
+        # Вся логика с 'shift_mask' больше не нужна.
         loss = F.cross_entropy(
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1),
-            reduction='none',
-        ).view(shift_logits.shape[0], -1)
+            ignore_index=-100 # Явно указываем (хотя это и так default)
+        )
         
-        # Apply loss mask (only compute on completion tokens)
-        if shift_mask.sum() > 0:
-            loss = (loss * shift_mask).sum() / shift_mask.sum()
-        else:
-            loss = loss.mean()
-        
-        # Normalize by gradient accumulation steps
+        # Проверяем, что loss не NaN (на всякий случай)
+        if torch.isnan(loss) or torch.isinf(loss):
+            self.logger.warning("NaN/Inf loss detected after F.cross_entropy")
+            return torch.tensor(0.0, device=input_ids.device, requires_grad=True)
+
+        # ✅ 5. Нормализуем loss
         loss = loss / self.config.data.gradient_accumulation_steps
         
         return loss
