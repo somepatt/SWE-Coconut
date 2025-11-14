@@ -109,10 +109,10 @@ def main(config_path: str):
         # Создаем словарь конфигов, который ожидает data.py
         # Это мост между config.py и data.py
         data_processing_config = {
-            "uniform_prob": config.training.get("uniform_prob", 0.0), # .get для гибкости
+            "uniform_prob": config.training.uniform_prob,
             "max_latent_stage": config.training.num_stages,
-            "pad_latent_to_max": config.training.get("pad_latent_to_max", False),
-            "no_cot": False, # Обучаем с CoT
+            "pad_latent_to_max": config.training.pad_latent_to_max,
+            "no_cot": False,
             "c_thought": config.training.continuous_thought_steps
         }
         

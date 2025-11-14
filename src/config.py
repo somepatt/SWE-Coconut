@@ -1,8 +1,10 @@
+# src/config.py
+
 from dataclasses import dataclass, field
 from typing import Optional, List
 import yaml
 from pathlib import Path
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 class ModelConfig(BaseModel):
     name: str
@@ -11,10 +13,10 @@ class ModelConfig(BaseModel):
     trust_remote_code: bool = True
     
     use_quantization: bool = True
-    quantization: dict = field(default_factory=dict)
+    quantization: dict = Field(default_factory=dict) 
     
     use_lora: bool = True
-    lora: dict = field(default_factory=dict)
+    lora: dict = Field(default_factory=dict)
 
 class DataConfig(BaseModel):
     dataset_name: str
@@ -29,13 +31,16 @@ class DataConfig(BaseModel):
 class CoconutTrainingConfig(BaseModel):
     num_stages: int = 3
     epoch_per_stage: int = 1
-    latent_dim: int = 256
+    
     continuous_thought_steps: int = 4
     warmup_steps: int = 100
     num_training_steps: int = 5000
     logging_steps: int = 10
     save_steps: int = 500
-    eval_steps: int = 1000
+    eval_steps: int = 100
+    
+    uniform_prob: float = 0.0
+    pad_latent_to_max: bool = False
 
 class OptimizerConfig(BaseModel):
     name: str = "adamw"
@@ -85,6 +90,6 @@ class TrainingConfig(BaseModel):
 def load_config(config_path: Optional[str] = None) -> TrainingConfig:
     """Load configuration from YAML or use defaults"""
     if config_path is None:
-        config_path = "config/default.yaml"
+        config_path = "config/default.yaml" 
     
     return TrainingConfig.from_yaml(config_path)
