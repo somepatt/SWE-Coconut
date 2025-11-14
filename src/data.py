@@ -5,43 +5,11 @@ from dataclasses import dataclass
 from typing import Optional, List, Dict
 import torch
 import torch.distributed as dist
-from datasets import Dataset, load_dataset
-from transformers import PreTrainedTokenizerBase, AutoTokenizer
-from transformers.data.data_collator import pad_without_fast_tokenizer_warning
-from loguru import logger
-
-Понял. Ты хочешь использовать dataset_name: "SWE-bench/SWE-smith" из твоего config.py, но текущий код в train.py и data.py несовместим с этим.
-
-train.py ожидает локальный путь (config.data.train_path), а data.py пытается открыть этот путь как JSON-файл (json.load(open(path))).
-
-Я исправлю data.py и train.py, чтобы они корректно загружали и обрабатывали датасет "SWE-bench/SWE-smith" с Hugging Face, используя твой DataConfig.
-
-1. data.py (Исправлено)
-Я полностью переписал функцию get_dataset, чтобы она:
-
-Импортировала load_dataset из библиотеки datasets.
-
-Использовала dataset_name и split из конфига.
-
-Исправил tokenize_sample, так как в "SWE-bench/SWE-smith" нет поля "answer". Мы будем использовать "problem_statement" как вопрос, а "patch" — как "мысли" (CoT) и ответ.
-
-Python
-
-# src/data.py
-import json
-import itertools
-import random
-from dataclasses import dataclass
-from typing import Optional, List, Dict
-import torch
-import torch.distributed as dist
-# ✅ ИМПОРТ
 from datasets import Dataset, load_dataset 
 from transformers import PreTrainedTokenizerBase, AutoTokenizer
 from transformers.data.data_collator import pad_without_fast_tokenizer_warning
 from loguru import logger
 
-# ✅ ФУНКЦИЯ ПЕРЕПИСАНА
 def get_dataset(
     dataset_name: str, 
     split: str, 
