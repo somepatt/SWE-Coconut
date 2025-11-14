@@ -78,12 +78,15 @@ def get_dataset(
 class MyCollator:
     """Collate with KV cache optimization"""
 
-
     tokenizer: PreTrainedTokenizerBase
     latent_id: Optional[int] = None
     label_pad_token_id: Optional[int] = -100
 
     def __call__(self, features, return_tensors=None):
+        # ✅ ДОБАВЛЕНА ПРОВЕРКА: на случай пустого батча
+        if not features:
+            return {}
+            
         assert self.tokenizer.padding_side == "right"
         
         # Find earliest latent position to pad for KV cache reuse
@@ -120,7 +123,9 @@ class MyCollator:
                 feature["attention_mask"] = [0] * n_tok_pad + feature["attention_mask"]
         
         return_tensors = "pt"
-        label_name = "label" if "label" in features.keys() else "labels"
+        
+        # ✅ ИСПРАВЛЕНИЕ 1: Проверяем ключи у features[0], а не у features
+        label_name = "label" if "label" in features[0].keys() else "labels"
         
         non_label_position_features = [
             {
@@ -138,18 +143,20 @@ class MyCollator:
             return_tensors=return_tensors,
         )
         
+        # ✅ ИСПРАВЛЕНИЕ 2: Проверяем ключи у features[0]
         labels = (
             [feature[label_name] for feature in features]
-            if label_name in features.keys()
+            if label_name in features[0].keys()
             else None
         )
         
         if labels is not None and all(label is None for label in labels):
             labels = None
         
+        # ✅ ИСПРАВЛЕНИЕ 3: Проверяем ключи у features[0]
         position_ids = (
             [feature["position_ids"] for feature in features]
-            if "position_ids" in features.keys()
+            if "position_ids" in features[0].keys()
             else None
         )
         
@@ -171,6 +178,8 @@ class MyCollator:
             )
         
         return batch
+
+        
 def get_question_latent_dataset(
     scheduled_stage,
     base_dataset,
