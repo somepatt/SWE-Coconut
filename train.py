@@ -132,11 +132,14 @@ def main(config_path: str):
         
         # Создаем датасет для конкретной стадии
         train_dataset = get_cot_latent_dataset(
-            base_train_dataset,
-            tokenizer,
-            config.data.max_seq_length,
-            config.data.max_prompt_length,
-            data_processing_config
+            scheduled_stage=stage,
+            base_dataset=base_train_dataset,
+            configs=data_processing_config,
+            start_id=start_id,
+            latent_id=latent_id,
+            end_id=end_id,
+            no_special_marker=False,
+            shuffle=True
         )
         
         # Создаем DataLoader для этой стадии
