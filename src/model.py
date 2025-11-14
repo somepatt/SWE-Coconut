@@ -282,8 +282,8 @@ class CoconutModel(nn.Module):
         
         return {
             'logits': logits,
-            'inputs_embeds': inputs_embeds,
-            'hidden_states': outputs.hidden_states[-1] if outputs.hidden_states else None,
+            # 'inputs_embeds': inputs_embeds,
+            # 'hidden_states': outputs.hidden_states[-1] if outputs.hidden_states else None,
         }
     
     def get_trainable_params(self):

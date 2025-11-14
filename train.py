@@ -93,12 +93,7 @@ def main(config_path: str):
         logger.error(f"Файл данных не найден: {e}")
         return
 
-    sampler = DistributedSampler(
-        base_train_dataset, 
-        num_replicas=world_size, 
-        rank=rank, 
-        shuffle=True
-    )
+    
         
     logger.info(f"Базовый трейн-сет загружен: {len(base_train_dataset)} сэмплов.")
     # logger.info(f"Базовый вал-сет загружен: {len(base_val_dataset)} сэмплов.")
@@ -139,6 +134,13 @@ def main(config_path: str):
             latent_id=latent_id,
             end_id=end_id,
             no_special_marker=False,
+            shuffle=False
+        )
+
+        sampler = DistributedSampler(
+            base_train_dataset, 
+            num_replicas=world_size, 
+            rank=rank, 
             shuffle=True
         )
         
@@ -155,9 +157,11 @@ def main(config_path: str):
         
         logger.info(f"DataLoader для стадии {stage} создан. "
                      f"Количество батчей: {len(train_loader)}")
+        sampler.set_epoch(stage)
         
         # Запускаем одну стадию обучения
         trainer.train_stage(stage=stage, dataloader=train_loader)
+        
         
         # (Опционально) Здесь можно добавить вызов валидации после каждой стадии
         # if base_val_dataset:
