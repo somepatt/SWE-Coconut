@@ -31,6 +31,8 @@ class CoconutTrainer:
         stage_loss = 0.0
         stage_examples = 0
         
+        device = next(self.model.parameters()).device
+
         for epoch in range(self.config.training.epoch_per_stage):
             self.logger.info(f"Epoch {epoch}/{self.config.training.epoch_per_stage} at stage {stage}")
             
@@ -44,7 +46,7 @@ class CoconutTrainer:
                 step_start_time = time.time()
                 
                 # Move batch to device
-                batch = {k: v.to('cuda') if isinstance(v, torch.Tensor) else v 
+                batch = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v 
                         for k, v in batch.items()}
                 
                 # Forward pass

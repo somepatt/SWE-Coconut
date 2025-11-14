@@ -4,9 +4,8 @@ output_dir: "./outputs"
 seed: 42
 
 model:
-  name: "Qwen/Qwen3-0.6B"
+  name: "Qwen/Qwen3-8B"
   dtype: "bfloat16"
-  device_map: "auto"
   trust_remote_code: true
   
   # Quantization
@@ -22,15 +21,15 @@ model:
   lora:
     r: 16
     lora_alpha: 32
-    target_modules: ["q_proj", "v_proj"]
+    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
     lora_dropout: 0.05
 
 data:
   dataset_name: "SWE-bench/SWE-smith"
   split: "train"
-  max_seq_length: 2048
-  max_prompt_length: 1024
-  batch_size: 8
+  max_seq_length: 4096
+  max_prompt_length: 2048
+  batch_size: 2
   num_workers: 4
   gradient_accumulation_steps: 1
   cache_dir: "./data_cache"

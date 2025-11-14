@@ -44,7 +44,7 @@ class CoconutModel(nn.Module):
         model = AutoModelForCausalLM.from_pretrained(
             self.config.model.name,
             quantization_config=bnb_config,
-            device_map=self.config.model.device_map,
+            device_map=None,
             trust_remote_code=self.config.model.trust_remote_code,
             torch_dtype=torch.bfloat16,
             attn_implementation="flash_attention_2",
