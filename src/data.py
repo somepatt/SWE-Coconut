@@ -1,182 +1,273 @@
-from datasets import load_dataset, Dataset
-from transformers import AutoTokenizer
-from torch.utils.data import DataLoader, IterableDataset
-from typing import Optional, List, Dict, Tuple
+import json
+import itertools
+import random
+from dataclasses import dataclass
+from typing import Optional, List, Dict
 import torch
+import torch.distributed as dist
+from datasets import Dataset
+from transformers import PreTrainedTokenizerBase, AutoTokenizer
+from transformers.data.data_collator import pad_without_fast_tokenizer_warning
 from loguru import logger
 
-class SWESmithDataset:
-    """
-    SWE-bench SWE-smith dataset for code bug fixing.
-    
-    Structure:
-    - problem_statement: Description of the bug/issue
-    - patch: Git diff with the solution
-    - test_patch: Tests to verify the fix
-    """
-    
-    def __init__(self, config):
-        self.config = config
-        self.logger = logger
-        
-    def load_dataset(self) -> Dataset:
-        """Load SWE-smith dataset from Hugging Face"""
-        self.logger.info(f"Loading dataset: {self.config.data.dataset_name}")
-        
-        dataset = load_dataset(
-            self.config.data.dataset_name,
-            split=self.config.data.split,
-            cache_dir=self.config.data.cache_dir,
+def get_dataset(path, tokenizer, max_size=1000000000):
+    """Load and tokenize dataset"""
+
+    def tokenize_sample(sample):
+        question_tokenized = tokenizer.encode(
+            sample["problem_statement"] + "\n", add_special_tokens=True
         )
         
-        self.logger.info(f"Dataset loaded. Size: {len(dataset)}")
-        return dataset
-    
-    def preprocess_example(
-        self, 
-        example: Dict,
-        tokenizer: AutoTokenizer
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Convert SWE-smith example to training format.
+        # For code, we use patch as reasoning steps
+        patch_lines = sample.get("patch", "").split("\n")
+        steps_tokenized = [
+            tokenizer.encode(line + "\n", add_special_tokens=False)
+            for line in patch_lines if line.strip()
+        ]
         
-        Format: [PROBLEM] issue description [SOLUTION] code fix
-        """
-        problem = example.get('problem_statement', '')
-        solution = example.get('patch', '')
-        
-        # Truncate long prompts
-        if len(problem) > self.config.data.max_prompt_length * 4:
-            problem = problem[:self.config.data.max_prompt_length * 4]
-        
-        # Create prompt-completion pair
-        prompt = f"Fix this bug:\n{problem}\n\nSolution:"
-        completion = f"\n{solution}"
-        
-        # Tokenize prompt
-        prompt_tokens = tokenizer.encode(prompt, add_special_tokens=False)
-        completion_tokens = tokenizer.encode(completion, add_special_tokens=False)
-        
-        # Combine
-        input_ids = prompt_tokens + completion_tokens
-        
-        # Truncate to max length
-        max_len = self.config.data.max_seq_length
-        if len(input_ids) > max_len:
-            input_ids = input_ids[:max_len]
-        
-        # Create loss mask (only compute loss on completion)
-        loss_mask = [False] * len(prompt_tokens) + [True] * (len(input_ids) - len(prompt_tokens))
-        loss_mask = loss_mask[:max_len]
+        answer_tokenized = tokenizer.encode(
+            "### " + sample.get("answer", ""), add_special_tokens=False
+        ) + [tokenizer.eos_token_id]
         
         return {
-            'input_ids': input_ids,
-            'loss_mask': loss_mask,
-            'problem': problem[:200],
-            'solution_length': len(completion_tokens),
+            "question_tokenized": question_tokenized,
+            "steps_tokenized": steps_tokenized,
+            "answer_tokenized": answer_tokenized,
+            "idx": sample["idx"],
         }
+
+    data = json.load(open(path))[:max_size]
+    data = [{**d, "idx": idx} for idx, d in enumerate(data)]
+
+    dataset = Dataset.from_list(data)
     
-    def prepare_dataset(self, tokenizer: AutoTokenizer) -> Dataset:
-        """Prepare dataset for training"""
-        dataset = self.load_dataset()
+    dataset = dataset.map(
+        tokenize_sample,
+        remove_columns=list(dataset.features),
+        num_proc=32
+    )
+
+    logger.info(f"Dataset loaded: {len(dataset)} samples")
+    return dataset
+
+
+@dataclass
+class MyCollator:
+    """Collate with KV cache optimization"""
+
+
+    tokenizer: PreTrainedTokenizerBase
+    latent_id: Optional[int] = None
+    label_pad_token_id: Optional[int] = -100
+
+    def __call__(self, features, return_tensors=None):
+        assert self.tokenizer.padding_side == "right"
         
-        self.logger.info("Preprocessing dataset...")
+        # Find earliest latent position to pad for KV cache reuse
+        earliest_latent = [
+            feature["input_ids"].index(self.latent_id)
+            for feature in features
+            if self.latent_id in feature["input_ids"]
+        ]
         
-        def preprocess_fn(examples):
-            batch_data = {
-                'input_ids': [],
-                'loss_mask': [],
-            }
+        if len(earliest_latent) > 0:
+            latest_earliest_latent = max(earliest_latent)
             
-            for idx in range(len(examples['problem_statement'])):
-                example = {
-                    'problem_statement': examples['problem_statement'][idx],
-                    'patch': examples.get('patch', [''])[idx] if 'patch' in examples else '',
-                }
+            for feature in features:
+                if self.latent_id in feature["input_ids"]:
+                    n_tok_pad = latest_earliest_latent - feature["input_ids"].index(
+                        self.latent_id
+                    )
+                else:
+                    n_tok_pad = 0
                 
-                try:
-                    processed = self.preprocess_example(example, tokenizer)
-                    batch_data['input_ids'].append(processed['input_ids'])
-                    batch_data['loss_mask'].append(processed['loss_mask'])
-                except Exception as e:
-                    self.logger.warning(f"Error processing example {idx}: {e}")
-                    continue
-            
-            return batch_data
+                feature["position_ids"] = [0] * n_tok_pad + list(
+                    range(len(feature["input_ids"]))
+                )
+                
+                feature["input_ids"] = [
+                    self.tokenizer.pad_token_id
+                ] * n_tok_pad + feature["input_ids"]
+                
+                if "labels" in feature:
+                    feature["labels"] = [
+                        self.label_pad_token_id
+                    ] * n_tok_pad + feature["labels"]
+                
+                feature["attention_mask"] = [0] * n_tok_pad + feature["attention_mask"]
         
-        processed_dataset = dataset.map(
-            preprocess_fn,
-            batched=True,
-            batch_size=100,
-            remove_columns=dataset.column_names,
+        return_tensors = "pt"
+        label_name = "label" if "label" in features.keys() else "labels"
+        
+        non_label_position_features = [
+            {
+                k: v
+                for k, v in feature.items()
+                if k != label_name and k != "position_ids"
+            }
+            for feature in features
+        ]
+        
+        batch = pad_without_fast_tokenizer_warning(
+            self.tokenizer,
+            non_label_position_features,
+            padding=True,
+            return_tensors=return_tensors,
         )
         
-        self.logger.info(f"Dataset preprocessed. Size: {len(processed_dataset)}")
-        return processed_dataset
-
-
-class CoconutDataCollator:
-    """Collate function for COCONUT training"""
-    
-    def __init__(self, tokenizer, max_seq_length: int = 1024):
-        self.tokenizer = tokenizer
-        self.max_seq_length = max_seq_length
-        self.logger = logger
-    
-    def __call__(self, batch: List[Dict]) -> Dict[str, torch.Tensor]:
-        """Collate batch for training"""
-        input_ids_list = []
-        loss_mask_list = []
+        labels = (
+            [feature[label_name] for feature in features]
+            if label_name in features.keys()
+            else None
+        )
         
-        for example in batch:
-            input_ids = example['input_ids']
-            loss_mask = example['loss_mask']
-            
-            # Pad or truncate
-            if len(input_ids) < self.max_seq_length:
-                pad_len = self.max_seq_length - len(input_ids)
-                input_ids = input_ids + [self.tokenizer.pad_token_id] * pad_len
-                loss_mask = loss_mask + [False] * pad_len
-            else:
-                input_ids = input_ids[:self.max_seq_length]
-                loss_mask = loss_mask[:self.max_seq_length]
-            
-            input_ids_list.append(input_ids)
-            loss_mask_list.append(loss_mask)
+        if labels is not None and all(label is None for label in labels):
+            labels = None
+        
+        position_ids = (
+            [feature["position_ids"] for feature in features]
+            if "position_ids" in features.keys()
+            else None
+        )
+        
+        if labels is not None:
+            max_label_length = max(len(l) for l in labels)
+            batch["labels"] = torch.tensor([
+                label + [self.label_pad_token_id] * (max_label_length - len(label))
+                for label in labels
+            ], dtype=torch.int64)
+        
+        if position_ids is not None:
+            max_pos_length = max(len(l) for l in position_ids)
+            batch["position_ids"] = torch.tensor(
+                [
+                    [0] * (max_pos_length - len(position_id)) + position_id
+                    for position_id in position_ids
+                ], 
+                dtype=torch.int64
+            )
+        
+        return batch
+def get_question_latent_dataset(
+    scheduled_stage,
+    base_dataset,
+    configs,
+    start_id,
+    latent_id,
+    end_id,
+    no_special_marker=False,
+    ):
+    """Dataset for generation (evaluation)"""
+
+
+    def process_dataset(sample):
+        if configs.get("pad_latent_to_max", False):
+            max_latent_stage = configs.get("max_latent_stage", 5)
+        else:
+            max_latent_stage = min(
+                configs.get("max_latent_stage", 5),
+                len(sample["steps_tokenized"])
+            )
+        
+        k = min(max_latent_stage, scheduled_stage)
+        k *= configs.get("c_thought", 1)
+        
+        tokens = (
+            sample["question_tokenized"]
+            + ([] if no_special_marker else [start_id])
+            + [latent_id] * k
+            + ([] if no_special_marker else [end_id])
+        )
         
         return {
-            'input_ids': torch.tensor(input_ids_list, dtype=torch.long),
-            'loss_mask': torch.tensor(loss_mask_list, dtype=torch.bool),
-            'attention_mask': torch.ones_like(torch.tensor(input_ids_list, dtype=torch.long)),
+            "input_ids": tokens,
+            "idx": sample["idx"],
+            "attention_mask":  [1] * len(tokens),
+            "position_ids": list(range(len(tokens))),
         }
 
+    return base_dataset.map(
+        process_dataset,
+        remove_columns=list(base_dataset.features),
+        num_proc=32
+    )
+def get_cot_latent_dataset(
+    scheduled_stage,
+    base_dataset,
+    configs,
+    start_id,
+    latent_id,
+    end_id,
+    no_special_marker=False,
+    shuffle=False,
+    ):
+    """Dataset for training with latent tokens"""
 
-def get_dataloader(
-    config,
-    tokenizer: AutoTokenizer,
-    stage: int = 0,
-) -> DataLoader:
-    """Get DataLoader for COCONUT training at given stage"""
-    logger.info(f"Loading data for stage {stage}")
-    
-    dataset_loader = SWESmithDataset(config)
-    dataset = dataset_loader.prepare_dataset(tokenizer)
-    
-    # Split for stages (simulate different difficulty)
-    samples_per_stage = len(dataset) // (config.training.num_stages + 1)
-    stage_dataset = dataset.select(
-        range(stage * samples_per_stage, (stage + 1) * samples_per_stage)
+    n_additional_tokens = 0 if no_special_marker else 2
+
+    def process_dataset(sample):
+        if random.random() < configs.get("uniform_prob", 0.0):
+            scheduled_stage_to_train = random.choice(
+                list(range(len(sample["steps_tokenized"]) + 1))
+            )
+        else:
+            scheduled_stage_to_train = scheduled_stage
+        
+        if scheduled_stage_to_train > configs.get("max_latent_stage", 5):
+            n_skip_steps = 10000
+            if configs.get("pad_latent_to_max", False):
+                n_latent_tokens = configs.get("max_latent_stage", 5)
+            else:
+                n_latent_tokens = min(
+                    len(sample["steps_tokenized"]),
+                    configs.get("max_latent_stage", 5)
+                )
+        else:
+            n_skip_steps = scheduled_stage_to_train
+            n_latent_tokens = scheduled_stage_to_train
+        
+        if configs.get("no_cot", False):
+            n_skip_steps = 100
+            n_latent_tokens = 0
+        
+        n_latent_tokens *= configs.get("c_thought", 1)
+        
+        tokens = (
+            sample["question_tokenized"]
+            + ([] if no_special_marker else [start_id])
+            + [latent_id] * n_latent_tokens
+            + ([] if no_special_marker else [end_id])
+            + list(itertools.chain.from_iterable(
+                sample["steps_tokenized"][n_skip_steps:]
+            ))
+            + sample["answer_tokenized"]
+        )
+        
+        return {
+            "input_ids": tokens,
+            "labels": (
+                [-100] * (
+                    len(sample["question_tokenized"])
+                    + n_latent_tokens
+                    + n_additional_tokens
+                )
+                + tokens[
+                    n_latent_tokens + n_additional_tokens
+                    + len(sample["question_tokenized"]):
+                ]
+            ),
+            "attention_mask": [1] * len(tokens),
+            "idx": sample["idx"],
+            "position_ids": list(range(len(tokens))),
+        }
+
+    processed_dataset = base_dataset.map(
+        process_dataset,
+        remove_columns=list(base_dataset.features),
+        num_proc=32
     )
-    
-    collator = CoconutDataCollator(tokenizer, config.data.max_seq_length)
-    
-    dataloader = DataLoader(
-        stage_dataset,
-        batch_size=config.data.batch_size,
-        collate_fn=collator,
-        num_workers=config.data.num_workers,
-        shuffle=True,
-    )
-    
-    logger.info(f"DataLoader created. Samples: {len(stage_dataset)}, Batch size: {config.data.batch_size}")
-    return dataloader
+
+    if shuffle:
+        processed_dataset = processed_dataset.shuffle()
+
+    return processed_dataset

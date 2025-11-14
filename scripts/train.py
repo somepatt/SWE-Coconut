@@ -1,67 +1,184 @@
-"""
-Main training script for COCONUT code LLM
-"""
-import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
-import sys
-import torch
+import argparse
 from pathlib import Path
+from loguru import logger
+from torch.utils.data import DataLoader
 
-# Add src to path
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+# Импортируем все кастомные модули из 'src'
+try:
+    from src.config import load_config, TrainingConfig
+    from src.logger import setup_logger
+    from src.utils import set_seed, get_device, setup_directories
+    from src.model import load_model_and_tokenizer
+    from src.data import get_dataset, get_cot_latent_dataset, MyCollator
+    from src.optimizer import OptimizerManager
+    from src.trainer import CoconutTrainer
+except ImportError as e:
+    print(f"Ошибка импорта: {e}")
+    print("Убедись, что ты запускаешь скрипт из корня проекта и что твои"
+          " модули находятся в директории 'src'.")
+    exit(1)
 
-from config import load_config
-from logger import setup_logger
-from model import load_model_and_tokenizer
-from data import get_dataloader
-from optimizer import OptimizerManager
-from trainer import CoconutTrainer
-from utils import set_seed, setup_directories, get_device
 
-def main():
-    # Load config
-    config = load_config("config/default.yaml")
-    import os
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+def main(config_path: str):
+    """
+    Главная функция обучения.
+    """
     
-    # Setup
-    setup_logger(config.output_dir, experiment_name=config.experiment_name)
-    setup_directories(config)
+    # 1. Загрузка конфига и настройка окружения
+    try:
+        config: TrainingConfig = load_config(config_path)
+    except FileNotFoundError:
+        logger.error(f"Файл конфигурации не найден по пути: {config_path}")
+        return
+    except Exception as e:
+        logger.error(f"Ошибка при загрузке конфига: {e}")
+        return
+
+    setup_logger(output_dir=config.output_dir, experiment_name=config.experiment_name)
     set_seed(config.seed)
+    setup_directories(config) # Создает output_dir
     device = get_device()
     
-    logger = __import__('loguru').logger
-    logger.info(f"Project: {config.project_name}")
-    logger.info(f"Experiment: {config.experiment_name}")
-    # logger.info(f"Config: {config.from_dict()}")
-    
-    # Load model and tokenizer
+    logger.info(f"Конфигурация успешно загружена из {config_path}")
+    logger.info(f"Эксперимент: {config.experiment_name}")
+    logger.info(f"Обучение будет запущено на устройстве: {device}")
+
+    # 2. Загрузка модели и токенайзера
+    # (Предполагается, что load_model_and_tokenizer в src/model.py
+    # корректно добавляет токены '<bot>', '<eot>', '<thought>')
+    logger.info("Загрузка модели и токенайзера...")
     model, tokenizer = load_model_and_tokenizer(config)
-    model = model.to(device)
+    model.to(device)
     
-    # Create optimizer
-    optimizer_manager = OptimizerManager(model, config)
-    
-    # Create trainer
-    trainer = CoconutTrainer(model, tokenizer, config, optimizer_manager)
-    
-    # COCONUT multi-stage training
-    logger.info(f"Starting COCONUT training with {config.training.num_stages + 1} stages")
-    
-    for stage in range(config.training.num_stages + 1):
-        logger.info(f"Loading data for stage {stage}")
-        dataloader = get_dataloader(config, tokenizer, stage)
+    # Получаем ID спец. токенов, необходимых для data.py
+    try:
+        latent_id = tokenizer.convert_tokens_to_ids('<thought>')
+        start_id = tokenizer.convert_tokens_to_ids('<bot>')
+        end_id = tokenizer.convert_tokens_to_ids('<eot>')
         
-        trainer.train_stage(stage, dataloader)
+        # Проверяем, что все токены были добавлены и найдены
+        if any(t is None or t == tokenizer.unk_token_id for t in [latent_id, start_id, end_id]):
+            raise ValueError("Один или несколько спец. токенов (<bot>, <eot>, <thought>) не найдены.")
+            
+    except Exception as e:
+        logger.error(f"Критическая ошибка: {e}")
+        logger.error("Не удалось получить ID спец. токенов.")
+        logger.error("Убедись, что 'load_model_and_tokenizer' в src/model.py "
+                     "корректно добавляет ['<bot>', '<eot>', '<thought>'] "
+                     "в токенайзер и что model.set_latent_token_id() "
+                     "устанавливает ID для '={latent_id}")
+
+    # 3. Загрузка базовых наборов данных
+    logger.info("Загрузка базовых наборов данных...")
+    try:
+        # Пути должны быть указаны в твоем .yaml файле (например, 'config/default.yaml')
+        # и соответствовать DataConfig в src/config.py
+        base_train_dataset = get_dataset(config.data.train_path, tokenizer)
+        # base_val_dataset = get_dataset(config.data.val_path, tokenizer) # Для валидации
+    except AttributeError as e:
+         logger.error(f"Ошибка: Отсутствует путь к данным в конфиге: {e}. ")
+         logger.error("Пожалуйста, добавь 'train_path' и 'val_path' "
+                      "в секцию 'data' твоего YAML-конфига.")
+         return
+    except FileNotFoundError as e:
+        logger.error(f"Файл данных не найден: {e}")
+        return
+        
+    logger.info(f"Базовый трейн-сет загружен: {len(base_train_dataset)} сэмплов.")
+    # logger.info(f"Базовый вал-сет загружен: {len(base_val_dataset)} сэмплов.")
+
+    # 4. Создание Collator
+    collator = MyCollator(tokenizer, latent_id=latent_id, label_pad_token_id=-100)
+
+    # 5. Создание Менеджера Оптимизатора и Тренера
+    optimizer_manager = OptimizerManager(model, config)
+    trainer = CoconutTrainer(model, tokenizer, config, optimizer_manager)
+
+    # 6. Запуск многостадийного обучения
+    logger.info("=" * 80)
+    logger.info("Начало многостадийного обучения COCONUT...")
+    logger.info(f"Всего стадий: {config.training.num_stages}")
+    logger.info("=" * 80)
     
-    logger.info("Training completed!")
+    for stage in range(1, config.training.num_stages + 1):
+        
+        # Создаем словарь конфигов, который ожидает data.py
+        # Это мост между config.py и data.py
+        data_processing_config = {
+            "uniform_prob": config.training.get("uniform_prob", 0.0), # .get для гибкости
+            "max_latent_stage": config.training.num_stages,
+            "pad_latent_to_max": config.training.get("pad_latent_to_max", False),
+            "no_cot": False, # Обучаем с CoT
+            "c_thought": config.training.continuous_thought_steps
+        }
+        
+        logger.info(f"Подготовка данных для Стадии {stage}/{config.training.num_stages}...")
+        
+        # Создаем датасет для конкретной стадии
+        train_dataset_stage = get_cot_latent_dataset(
+            scheduled_stage=stage,
+            base_dataset=base_train_dataset,
+            configs=data_processing_config,
+            start_id=start_id,
+            latent_id=latent_id,
+            end_id=end_id,
+            no_special_marker=False,
+            shuffle=True
+        )
+        
+        # Создаем DataLoader для этой стадии
+        train_loader = DataLoader(
+            train_dataset_stage,
+            batch_size=config.data.batch_size,
+            collate_fn=collator,
+            shuffle=True, # Важно для обучения
+            num_workers=config.data.num_workers
+        )
+        
+        logger.info(f"DataLoader для стадии {stage} создан. "
+                     f"Количество батчей: {len(train_loader)}")
+        
+        # Запускаем одну стадию обучения
+        trainer.train_stage(stage=stage, dataloader=train_loader)
+        
+        # (Опционально) Здесь можно добавить вызов валидации после каждой стадии
+        # if base_val_dataset:
+        #    logger.info(f"Запуск валидации после стадии {stage}...")
+        #    # ... (логика валидации) ...
+
+    logger.info("=" * 80)
+    logger.info("Обучение COCONUT успешно завершено.")
+    logger.info("=" * 80)
     
-    # Save final model
-    final_dir = Path(config.output_dir) / "final_model"
-    model.model.save_pretrained(str(final_dir))
-    tokenizer.save_pretrained(str(final_dir))
-    logger.info(f"Final model saved to {final_dir}")
+    # 7. Сохранение финальной модели
+    # (Хотя CoconutTrainer сохраняет чекпоинты, финальное сохранение полезно)
+    try:
+        final_save_dir = Path(config.output_dir) / "final_model"
+        final_save_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Сохраняем базовую модель (Peft или обычную)
+        model.model.save_pretrained(str(final_save_dir))
+        
+        # Сохраняем токенайзер
+        tokenizer.save_pretrained(str(final_save_dir))
+        
+        # Сохраняем конфиг, с которым модель обучалась
+        config.to_yaml(str(final_save_dir / "config.yaml"))
+        
+        logger.info(f"Финальная модель сохранена в: {final_save_dir}")
+    except Exception as e:
+        logger.error(f"Ошибка при сохранении финальной модели: {e}")
+
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Запуск обучения модели COCONUT")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="config/default.yaml",
+        help="Путь к YAML-файлу конфигурации обучения."
+    )
+    
+    args = parser.parse_args()
+    
+    main(args.config)

@@ -46,7 +46,6 @@ training:
   # stage 2: 66% - 2/3 латентных, 1/3 language
   # stage 3: 100% - все латентные
   
-  latent_dim: 256  # Размерность латентного пространства
   continuous_thought_steps: 2  # Кол-во латентных шагов
   
   warmup_steps: 100

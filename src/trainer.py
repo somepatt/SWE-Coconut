@@ -132,11 +132,9 @@ class CoconutTrainer:
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=input_ids,
-            stage=stage,
         )
         
         logits = outputs['logits']
-        loss_raw = outputs['loss']
         
         # Shift for next token prediction
         shift_logits = logits[..., :-1, :].contiguous()

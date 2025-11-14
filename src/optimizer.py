@@ -51,7 +51,7 @@ class OptimizerManager:
         # Linear decay after warmup
         decay_scheduler = LinearLR(
             self.optimizer,
-            start_factor=1.0,
+            start_factor=0.1,
             end_factor=0.0,
             total_iters=self.config.training.num_training_steps - self.config.optimizer.warmup_steps,
         )

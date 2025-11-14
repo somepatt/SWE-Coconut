@@ -1,99 +1,15 @@
-# src/model.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, BitsAndBytesConfig, AutoTokenizer
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, List
 from loguru import logger
-
-class LatentReasoningModule(nn.Module):
-    """
-    Latent reasoning module for COCONUT.
-    Converts language tokens to continuous latent thoughts and back.
-    """
-    
-    def __init__(self, hidden_size: int, latent_dim: int, num_steps: int):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.latent_dim = latent_dim
-        self.num_steps = num_steps
-        
-        # Encode language hidden states to latent space
-        self.to_latent = nn.Sequential(
-            nn.Linear(hidden_size, latent_dim * 2),
-            nn.ReLU(),
-            nn.Linear(latent_dim * 2, latent_dim),
-        )
-        
-        # Decode latent thoughts back to hidden space
-        self.from_latent = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim * 2),
-            nn.ReLU(),
-            nn.Linear(latent_dim * 2, hidden_size),
-        )
-        
-        # Latent reasoning RNN (iterate over latent space)
-        self.latent_rnn = nn.GRUCell(latent_dim, latent_dim)
-    
-    def encode_to_latent(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Convert hidden states to latent thoughts"""
-        return self.to_latent(hidden_states)
-    
-    def decode_from_latent(self, latent_states: torch.Tensor) -> torch.Tensor:
-        """Convert latent thoughts back to hidden states"""
-        return self.from_latent(latent_states)
-    
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        num_reasoning_steps: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Perform latent reasoning.
-        
-        Args:
-            hidden_states: [batch, seq_len, hidden_size]
-            num_reasoning_steps: Number of latent reasoning iterations
-            
-        Returns:
-            decoded_states: [batch, seq_len, hidden_size]
-            latent_trajectory: [batch, seq_len, num_steps, latent_dim]
-        """
-        batch_size, seq_len, _ = hidden_states.shape
-        
-        # Encode to latent space
-        latent = self.encode_to_latent(hidden_states)  # [batch, seq_len, latent_dim]
-        
-        # Store trajectory for logging/analysis
-        latent_trajectory = latent.unsqueeze(2).repeat(1, 1, num_reasoning_steps, 1)
-        
-        # Reasoning iterations in latent space
-        for step in range(num_reasoning_steps):
-            # Apply RNN to update latent thoughts
-            latent_updated = self.latent_rnn(
-                latent.view(-1, self.latent_dim),
-                latent.view(-1, self.latent_dim)
-            )
-            latent = latent_updated.view(batch_size, seq_len, self.latent_dim)
-            
-            # Store step
-            latent_trajectory[:, :, step, :] = latent
-        
-        # Decode back to hidden space
-        decoded_states = self.decode_from_latent(latent)  # [batch, seq_len, hidden_size]
-        
-        return decoded_states, latent_trajectory
-
 
 class CoconutModel(nn.Module):
     """
-    COCONUT model with proper stage-dependent latent reasoning.
-    
-    Stage 0: Pure language tokens (no latent)
-    Stage 1: 33% latent replacement
-    Stage 2: 66% latent replacement
-    Stage 3: 100% latent replacement (full reasoning in latent space)
+    COCONUT: Chain of Continuous Thought
+
     """
     
     def __init__(self, config):
@@ -104,19 +20,16 @@ class CoconutModel(nn.Module):
         # Load base model
         self.model = self._load_model()
         
-        # Add latent reasoning if configured
-        if config.training.latent_dim > 0:
-            self.latent_module = LatentReasoningModule(
-                hidden_size=self.model.config.hidden_size,
-                latent_dim=config.training.latent_dim,
-                num_steps=config.training.continuous_thought_steps,
-            )
+        # Get embedding layer
+        self.embedding = self.model.get_input_embeddings()
+        
+        # Special token IDs for latent reasoning
+        self.latent_token_id = None  # Will be set after tokenizer is loaded
     
     def _load_model(self) -> AutoModelForCausalLM:
         """Load base model with quantization and LoRA"""
         self.logger.info(f"Loading model: {self.config.model.name}")
         
-        # Quantization config
         bnb_config = None
         if self.config.model.use_quantization:
             bnb_config = BitsAndBytesConfig(
@@ -126,7 +39,6 @@ class CoconutModel(nn.Module):
                 bnb_4bit_use_double_quant=self.config.model.quantization['bnb_4bit_use_double_quant'],
             )
         
-        # Load model
         model = AutoModelForCausalLM.from_pretrained(
             self.config.model.name,
             quantization_config=bnb_config,
@@ -138,11 +50,9 @@ class CoconutModel(nn.Module):
         
         self.logger.info(f"Model loaded: {model.config.model_type}")
         
-        # Prepare for LoRA
         if self.config.model.use_quantization:
             model = prepare_model_for_kbit_training(model)
         
-        # Add LoRA
         if self.config.model.use_lora:
             lora_config = LoraConfig(
                 r=self.config.model.lora['r'],
@@ -157,80 +67,221 @@ class CoconutModel(nn.Module):
         
         return model
     
+    def set_latent_token_id(self, token_id: int):
+        """Set the special token ID for latent reasoning"""
+        self.latent_token_id = token_id
+        self.logger.info(f"Latent token ID set to: {token_id}")
+    
+    def _find_latent_positions(
+        self, 
+        input_ids: torch.Tensor
+    ) -> List[List[int]]:
+        """
+        Find positions of <latent> tokens in each sequence.
+        
+        Returns:
+            List of lists: [[pos1, pos2, ...], [pos1, ...], ...]
+            One list per batch item
+        """
+        if self.latent_token_id is None:
+            return [[] for _ in range(input_ids.shape[0])]
+        
+        # Find all latent token positions
+        latent_indices = (input_ids == self.latent_token_id).nonzero()
+        
+        # Group by batch
+        latent_lists = [
+            [idx[1].item() for idx in latent_indices if idx[0] == i]
+            for i in range(input_ids.shape[0])
+        ]
+        
+        return latent_lists
+    
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
-        stage: int = 0,
     ) -> Dict:
         """
-        Forward pass with stage-dependent latent reasoning.
+        ✅ COCONUT forward pass with continuous thought.
         
         Args:
             input_ids: [batch, seq_len]
             attention_mask: [batch, seq_len]
+            position_ids: [batch, seq_len]
             labels: [batch, seq_len]
-            stage: Training stage (0-3)
-                - 0: Language only
-                - 1: 33% latent
-                - 2: 66% latent
-                - 3: 100% latent
+            stage: Training stage (determines how many latent tokens to use)
+        
+        Returns:
+            Dict with logits, loss, and reasoning trajectory
         """
         
-        # Get hidden states from base model
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            return_dict=True,
-        )
+        batch_size, seq_len = input_ids.shape
+        device = input_ids.device
         
-        hidden_states = outputs.hidden_states[-1]  # Last layer hidden states
-        logits = outputs.logits
+        # Create position_ids if not provided
+        if position_ids is None:
+            position_ids = torch.arange(
+                0, seq_len, dtype=torch.long, device=device
+            ).unsqueeze(0).expand(batch_size, -1)
         
-        if stage > 0 and self.config.training.latent_dim > 0:
-            # Коэффициент замены: на какую долю токенов применить latent reasoning
-            latent_ratio = stage / self.config.training.num_stages
-            
-            self.logger.debug(
-                f"Stage {stage}: Applying latent reasoning to {latent_ratio:.1%} of tokens"
+        # ✅ Step 1: Get initial embeddings
+        inputs_embeds = self.embedding(input_ids)  # [batch, seq_len, hidden_size]
+        
+        # ✅ Step 2: Find latent token positions
+        latent_lists = self._find_latent_positions(input_ids)
+        max_n_latents = max([len(l) for l in latent_lists])
+        
+        if max_n_latents == 0:
+            # No latent reasoning, standard forward pass
+            outputs = self.model(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                output_hidden_states=True,
+                return_dict=True,
             )
             
-            # Применить латентное рассуждение
-            latent_hidden_states, latent_trajectory = self.latent_module(
-                hidden_states,
-                num_reasoning_steps=self.config.training.continuous_thought_steps,
-            )
-            
-            # Blend между языковыми токенами и латентными мыслями
-            hidden_states = (
-                (1 - latent_ratio) * hidden_states +  # Language tokens
-                latent_ratio * latent_hidden_states     # Latent reasoning
-            )
-            
-            # Пересчитать logits с обновленными hidden states
-            logits = self.model.lm_head(hidden_states)
+            logits = outputs.logits
         else:
-            latent_trajectory = None
+            
+            all_logits = []
+            kv_cache = None
+            next_compute_range = (0, seq_len)
+            
+            # Find first latent token position
+            if max_n_latents > 0:
+                first_latent_pos = min([l[0] for l in latent_lists if len(l) > 0])
+                next_compute_range = (0, first_latent_pos)
+            
+            # ✅ Step 3: Iterative latent reasoning
+            for pass_idx in range(max_n_latents):
+                # Forward pass for this chunk
+                if kv_cache is None:
+                    # First pass - no cache
+                    outputs = self.model(
+                        inputs_embeds=inputs_embeds[
+                            :, next_compute_range[0]:next_compute_range[1], :
+                        ],
+                        attention_mask=attention_mask[
+                            :, next_compute_range[0]:next_compute_range[1]
+                        ] if attention_mask is not None else None,
+                        position_ids=position_ids[
+                            :, next_compute_range[0]:next_compute_range[1]
+                        ],
+                        output_hidden_states=True,
+                        return_dict=True,
+                        use_cache=True,
+                    )
+                    hidden_states_offset = 0
+                else:
+                    # Subsequent passes - use KV cache
+                    past_key_values = [
+                        (
+                            k[:, :, :next_compute_range[0], :],
+                            v[:, :, :next_compute_range[0], :],
+                        )
+                        for k, v in kv_cache
+                    ]
+                    
+                    outputs = self.model(
+                        inputs_embeds=inputs_embeds[
+                            :, next_compute_range[0]:next_compute_range[1], :
+                        ],
+                        attention_mask=attention_mask[:, :next_compute_range[1]]
+                            if attention_mask is not None else None,
+                        position_ids=position_ids[
+                            :, next_compute_range[0]:next_compute_range[1]
+                        ],
+                        past_key_values=past_key_values,
+                        output_hidden_states=True,
+                        return_dict=True,
+                        use_cache=True,
+                    )
+                    hidden_states_offset = next_compute_range[0]
+                
+                # Collect logits
+                all_logits.append(outputs.logits)
+                
+                # Get hidden states
+                hidden_states = outputs.hidden_states[-1]
+                kv_cache = outputs.past_key_values
+                
+                # ✅ Step 4: REPLACE latent token embeddings with hidden states
+                
+                # Find which latent tokens to replace in this pass
+                filling_indices = [
+                    (batch_idx, token_pos)
+                    for batch_idx, pos_list in enumerate(latent_lists)
+                    if len(pos_list) > pass_idx
+                    for token_pos in [pos_list[pass_idx]]
+                ]
+                
+                if filling_indices:
+                    # Convert inputs_embeds to list for modification
+                    # (to avoid in-place operations)
+                    inputs_embeds_list = [
+                        [inputs_embeds[b, t, :] for t in range(seq_len)]
+                        for b in range(batch_size)
+                    ]
+                    
+                    # Replace latent tokens with hidden states
+                    for batch_idx, token_idx in filling_indices:
+                        # ✅ KEY: Use hidden state from PREVIOUS position
+                        inputs_embeds_list[batch_idx][token_idx] = hidden_states[
+                            batch_idx, 
+                            token_idx - 1 - hidden_states_offset, 
+                            :
+                        ]
+                    
+                    # Reassemble inputs_embeds
+                    inputs_embeds = torch.stack([
+                        torch.stack(inputs_embeds_list[b])
+                        for b in range(batch_size)
+                    ])
+                
+                # Update compute range for next iteration
+                next_compute_range = (
+                    next_compute_range[1],
+                    seq_len if pass_idx + 1 >= max_n_latents 
+                    else next_compute_range[1] + 1
+                )
+            
+            # ✅ Step 5: Final pass with all latent tokens replaced
+            past_key_values = [
+                (
+                    k[:, :, :next_compute_range[0], :],
+                    v[:, :, :next_compute_range[0], :],
+                )
+                for k, v in kv_cache
+            ] if kv_cache else None
+            
+            outputs = self.model(
+                inputs_embeds=inputs_embeds[
+                    :, next_compute_range[0]:next_compute_range[1], :
+                ],
+                attention_mask=attention_mask[:, :next_compute_range[1]]
+                    if attention_mask is not None else None,
+                position_ids=position_ids[
+                    :, next_compute_range[0]:next_compute_range[1]
+                ],
+                past_key_values=past_key_values,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            
+            all_logits.append(outputs.logits)
+            
+            # Concatenate all logits
+            logits = torch.cat(all_logits, dim=1)  # [batch, seq_len, vocab_size]
         
-        # Compute loss if labels provided
-        loss = None
-        if labels is not None:
-            loss_fn = torch.nn.CrossEntropyLoss(reduction='none')
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss = loss_fn(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-            ).view(shift_logits.shape[0], -1)
         
         return {
             'logits': logits,
-            'loss': loss,
-            'hidden_states': hidden_states,
-            'latent_trajectory': latent_trajectory,
-            'stage': stage,
+            'inputs_embeds': inputs_embeds,
+            'hidden_states': outputs.hidden_states[-1] if outputs.hidden_states else None,
         }
     
     def get_trainable_params(self):
@@ -243,7 +294,7 @@ class CoconutModel(nn.Module):
 
 
 def load_model_and_tokenizer(config):
-    """Load model and tokenizer"""
+    """Load model and tokenizer with latent token setup"""
     logger.info("Loading model and tokenizer...")
     
     tokenizer = AutoTokenizer.from_pretrained(
@@ -251,11 +302,28 @@ def load_model_and_tokenizer(config):
         trust_remote_code=config.model.trust_remote_code,
     )
     
-    # Add padding token if needed
+    # Add special tokens for latent reasoning
+    special_tokens = {
+        'additional_special_tokens': ['<bot>', '<eot>', '<thought>']
+    }
+    num_added = tokenizer.add_special_tokens(special_tokens)
+    logger.info(f"Added {num_added} special tokens: {special_tokens.keys()}")
+    
+    # Set padding token
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
+    # Load model
     model = CoconutModel(config)
+    
+    # Resize embeddings if new tokens were added
+    if num_added > 0:
+        model.model.resize_token_embeddings(len(tokenizer))
+        model.embedding = model.model.get_input_embeddings()
+    
+    # Set latent token ID
+    latent_token_id = tokenizer.convert_tokens_to_ids('<thought>')
+    model.set_latent_token_id(latent_token_id)
     
     logger.info("Model and tokenizer loaded successfully")
     return model, tokenizer
