@@ -2,6 +2,8 @@ import argparse
 from pathlib import Path
 from loguru import logger
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from src.utils import setup_distributed
 
 # Импортируем все кастомные модули из 'src'
 try:
@@ -34,8 +36,11 @@ def main(config_path: str):
         logger.error(f"Ошибка при загрузке конфига: {e}")
         return
 
+    device, rank, world_size = setup_distributed()
+    config.data.batch_size //= world_size
+
     setup_logger(output_dir=config.output_dir, experiment_name=config.experiment_name)
-    set_seed(config.seed)
+    set_seed(config.seed + rank) # Разный seed для каждого процесса
     setup_directories(config) # Создает output_dir
     device = get_device()
     
@@ -87,6 +92,13 @@ def main(config_path: str):
     except FileNotFoundError as e:
         logger.error(f"Файл данных не найден: {e}")
         return
+
+    sampler = DistributedSampler(
+        base_train_dataset, 
+        num_replicas=world_size, 
+        rank=rank, 
+        shuffle=True
+    )
         
     logger.info(f"Базовый трейн-сет загружен: {len(base_train_dataset)} сэмплов.")
     # logger.info(f"Базовый вал-сет загружен: {len(base_val_dataset)} сэмплов.")
@@ -119,24 +131,23 @@ def main(config_path: str):
         logger.info(f"Подготовка данных для Стадии {stage}/{config.training.num_stages}...")
         
         # Создаем датасет для конкретной стадии
-        train_dataset_stage = get_cot_latent_dataset(
-            scheduled_stage=stage,
-            base_dataset=base_train_dataset,
-            configs=data_processing_config,
-            start_id=start_id,
-            latent_id=latent_id,
-            end_id=end_id,
-            no_special_marker=False,
-            shuffle=True
+        train_dataset = get_cot_latent_dataset(
+            base_train_dataset,
+            tokenizer,
+            config.data.max_seq_length,
+            config.data.max_prompt_length,
+            data_processing_config
         )
         
         # Создаем DataLoader для этой стадии
         train_loader = DataLoader(
-            train_dataset_stage,
+            train_dataset,
             batch_size=config.data.batch_size,
-            collate_fn=collator,
-            shuffle=True, # Важно для обучения
-            num_workers=config.data.num_workers
+            collate_fn=MyCollator(tokenizer, latent_id=latent_id),
+            num_workers=config.data.num_workers,
+            sampler=sampler,
+            pin_memory=True,
+            drop_last=True
         )
         
         logger.info(f"DataLoader для стадии {stage} создан. "
@@ -156,22 +167,23 @@ def main(config_path: str):
     
     # 7. Сохранение финальной модели
     # (Хотя CoconutTrainer сохраняет чекпоинты, финальное сохранение полезно)
-    try:
-        final_save_dir = Path(config.output_dir) / "final_model"
-        final_save_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Сохраняем базовую модель (Peft или обычную)
-        model.model.save_pretrained(str(final_save_dir))
-        
-        # Сохраняем токенайзер
-        tokenizer.save_pretrained(str(final_save_dir))
-        
-        # Сохраняем конфиг, с которым модель обучалась
-        config.to_yaml(str(final_save_dir / "config.yaml"))
-        
-        logger.info(f"Финальная модель сохранена в: {final_save_dir}")
-    except Exception as e:
-        logger.error(f"Ошибка при сохранении финальной модели: {e}")
+    if rank == 0:
+        try:
+            final_save_dir = Path(config.output_dir) / "final_model"
+            final_save_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Сохраняем базовую модель (Peft или обычную)
+            model.model.save_pretrained(str(final_save_dir))
+            
+            # Сохраняем токенайзер
+            tokenizer.save_pretrained(str(final_save_dir))
+            
+            # Сохраняем конфиг, с которым модель обучалась
+            config.to_yaml(str(final_save_dir / "config.yaml"))
+            
+            logger.info(f"Финальная модель сохранена в: {final_save_dir}")
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении финальной модели: {e}")
 
 
 if __name__ == "__main__":

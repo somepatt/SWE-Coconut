@@ -5,6 +5,8 @@ from transformers import AutoModelForCausalLM, BitsAndBytesConfig, AutoTokenizer
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from typing import Optional, Tuple, Dict, List
 from loguru import logger
+import torch.nn.parallel as ddp
+from src.utils import setup_distributed, get_world_size_and_rank
 
 class CoconutModel(nn.Module):
     """
@@ -320,6 +322,20 @@ def load_model_and_tokenizer(config):
     if num_added > 0:
         model.model.resize_token_embeddings(len(tokenizer))
         model.embedding = model.model.get_input_embeddings()
+
+    device, rank, world_size = setup_distributed()
+    model = model.to(device)
+
+    if world_size > 1:
+        # NOTE: find_unused_parameters=True может быть полезен для COCONUT, 
+        # но может замедлить работу. Начни без него.
+        model.model = ddp.DistributedDataParallel(
+            model.model,
+            device_ids=[rank],
+            output_device=rank,
+            # find_unused_parameters=True 
+        )
+        model.logger.info(f"Model wrapped in DDP on GPU {rank}.")
     
     # Set latent token ID
     latent_token_id = tokenizer.convert_tokens_to_ids('<thought>')
