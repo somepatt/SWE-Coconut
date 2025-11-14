@@ -5,49 +5,104 @@ from dataclasses import dataclass
 from typing import Optional, List, Dict
 import torch
 import torch.distributed as dist
-from datasets import Dataset
+from datasets import Dataset, load_dataset
 from transformers import PreTrainedTokenizerBase, AutoTokenizer
 from transformers.data.data_collator import pad_without_fast_tokenizer_warning
 from loguru import logger
 
-def get_dataset(path, tokenizer, max_size=1000000000):
-    """Load and tokenize dataset"""
+Понял. Ты хочешь использовать dataset_name: "SWE-bench/SWE-smith" из твоего config.py, но текущий код в train.py и data.py несовместим с этим.
 
-    def tokenize_sample(sample):
+train.py ожидает локальный путь (config.data.train_path), а data.py пытается открыть этот путь как JSON-файл (json.load(open(path))).
+
+Я исправлю data.py и train.py, чтобы они корректно загружали и обрабатывали датасет "SWE-bench/SWE-smith" с Hugging Face, используя твой DataConfig.
+
+1. data.py (Исправлено)
+Я полностью переписал функцию get_dataset, чтобы она:
+
+Импортировала load_dataset из библиотеки datasets.
+
+Использовала dataset_name и split из конфига.
+
+Исправил tokenize_sample, так как в "SWE-bench/SWE-smith" нет поля "answer". Мы будем использовать "problem_statement" как вопрос, а "patch" — как "мысли" (CoT) и ответ.
+
+Python
+
+# src/data.py
+import json
+import itertools
+import random
+from dataclasses import dataclass
+from typing import Optional, List, Dict
+import torch
+import torch.distributed as dist
+# ✅ ИМПОРТ
+from datasets import Dataset, load_dataset 
+from transformers import PreTrainedTokenizerBase, AutoTokenizer
+from transformers.data.data_collator import pad_without_fast_tokenizer_warning
+from loguru import logger
+
+# ✅ ФУНКЦИЯ ПЕРЕПИСАНА
+def get_dataset(
+    dataset_name: str, 
+    split: str, 
+    tokenizer: PreTrainedTokenizerBase, 
+    max_size=1000000000
+) -> Dataset:
+    """Load and tokenize dataset from Hugging Face"""
+    
+    logger.info(f"Loading dataset '{dataset_name}' split '{split}' from Hugging Face...")
+
+    try:
+        # Загружаем датасет с Hugging Face
+        dataset = load_dataset(dataset_name, split=split)
+    except Exception as e:
+        logger.error(f"Не удалось загрузить датасет '{dataset_name}': {e}")
+        logger.error("Убедись, что у тебя есть доступ к интернету и 'datasets' "
+                     "библиотека установлена (pip install datasets).")
+        raise
+
+    if max_size < len(dataset):
+        logger.warning(f"Using a subset of {max_size} samples (full size: {len(dataset)})")
+        dataset = dataset.select(range(max_size))
+
+    def tokenize_sample(sample, idx):
+        """
+        Tokenizes a sample from 'SWE-bench/SWE-smith'
+        Question = problem_statement
+        Steps (CoT) = lines from 'patch'
+        Answer = [EOS] (since 'patch' is the full output)
+        """
+        
+        # 'problem_statement' - это наш вопрос
         question_tokenized = tokenizer.encode(
             sample["problem_statement"] + "\n", add_special_tokens=True
         )
         
-        # For code, we use patch as reasoning steps
+        # 'patch' - это наши "мысли" (Chain-of-Thought), разбитые по строкам
         patch_lines = sample.get("patch", "").split("\n")
         steps_tokenized = [
             tokenizer.encode(line + "\n", add_special_tokens=False)
             for line in patch_lines if line.strip()
         ]
         
-        answer_tokenized = tokenizer.encode(
-            "### " + sample.get("answer", ""), add_special_tokens=False
-        ) + [tokenizer.eos_token_id]
+        answer_tokenized = [tokenizer.eos_token_id]
         
         return {
             "question_tokenized": question_tokenized,
             "steps_tokenized": steps_tokenized,
             "answer_tokenized": answer_tokenized,
-            "idx": sample["idx"],
+            "idx": idx, # Добавляем 'idx'
         }
 
-    data = json.load(open(path))[:max_size]
-    data = [{**d, "idx": idx} for idx, d in enumerate(data)]
-
-    dataset = Dataset.from_list(data)
-    
+    # Применяем токенизацию
     dataset = dataset.map(
         tokenize_sample,
-        remove_columns=list(dataset.features),
+        with_indices=True, # Передаем 'idx' в функцию
+        remove_columns=list(dataset.features), # Удаляем старые колонки
         num_proc=32
     )
 
-    logger.info(f"Dataset loaded: {len(dataset)} samples")
+    logger.info(f"Dataset loaded and tokenized: {len(dataset)} samples")
     return dataset
 
 

@@ -73,13 +73,17 @@ def main(config_path: str):
     try:
         # Пути должны быть указаны в твоем .yaml файле (например, 'config/default.yaml')
         # и соответствовать DataConfig в src/config.py
-        base_train_dataset = get_dataset(config.data.train_path, tokenizer)
+        base_train_dataset = get_dataset(
+            dataset_name=config.data.dataset_name,
+            split=config.data.split, # т.е. "train" из твоего DataConfig
+            tokenizer=tokenizer
+            )
         # base_val_dataset = get_dataset(config.data.val_path, tokenizer) # Для валидации
     except AttributeError as e:
-         logger.error(f"Ошибка: Отсутствует путь к данным в конфиге: {e}. ")
-         logger.error("Пожалуйста, добавь 'train_path' и 'val_path' "
+        logger.error(f"Ошибка: Отсутствует 'dataset_name' или 'split' в конфиге: {e}. ")
+        logger.error("Пожалуйста, добавь 'dataset_name' и 'split' "
                       "в секцию 'data' твоего YAML-конфига.")
-         return
+        return
     except FileNotFoundError as e:
         logger.error(f"Файл данных не найден: {e}")
         return
