@@ -18,6 +18,8 @@ class ModelConfig(BaseModel):
     use_lora: bool = True
     lora: dict = Field(default_factory=dict)
 
+    resume_from_checkpoint: Optional[str] = None
+
 class DataConfig(BaseModel):
     dataset_name: str
     split: str = "train"

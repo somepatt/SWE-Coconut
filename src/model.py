@@ -1,6 +1,8 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from safetensors.torch import load_file
 from transformers import AutoModelForCausalLM, BitsAndBytesConfig, AutoTokenizer
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from typing import Optional, Tuple, Dict, List
@@ -53,21 +55,60 @@ class CoconutModel(nn.Module):
         self.logger.info(f"Model loaded: {model.config.model_type}")
         
         if self.config.model.use_quantization:
-            model = prepare_model_for_kbit_training(model)
+            base_model = prepare_model_for_kbit_training(model)
+
+        model.gradient_checkpointing_enable()
+        self.logger.info("Gradient checkpointing enabled (required for COCONUT loop)")
+        
+        adapters_path = getattr(self.config.model, "resume_from_checkpoint", None)
         
         if self.config.model.use_lora:
+            # создаём такую же LoRA-конфигурацию, как при первом запуске
+            lora_cfg = self.config.model.lora
             lora_config = LoraConfig(
-                r=self.config.model.lora['r'],
-                lora_alpha=self.config.model.lora['lora_alpha'],
-                target_modules=self.config.model.lora['target_modules'],
-                lora_dropout=self.config.model.lora['lora_dropout'],
+                r=lora_cfg["r"],
+                lora_alpha=lora_cfg["lora_alpha"],
+                target_modules=lora_cfg["target_modules"],
+                lora_dropout=lora_cfg["lora_dropout"],
                 bias="none",
                 task_type="CAUSAL_LM",
             )
-            model = get_peft_model(model, lora_config)
-            self.logger.info("LoRA adapters added")
-        
+
+            model = get_peft_model(base_model, lora_config)
+            self.logger.info("LoRA adapters initialized.")
+
+            # 4) если указан чекпоинт — подгружаем веса адаптера вручную
+            ckpt_dir = getattr(self.config.model, "resume_from_checkpoint", None)
+            if ckpt_dir:
+                adapter_path = os.path.join(ckpt_dir, "adapter_model.safetensors")
+                self.logger.info(f"Loading LoRA weights from {adapter_path}")
+
+                if not os.path.isfile(adapter_path):
+                    self.logger.error(f"adapter_model.safetensors not found at {adapter_path}")
+                else:
+                    state_dict = load_file(adapter_path)
+
+                    # 🔑 выкидываем эмбеддинги и lm_head, которые конфликтуют по размеру
+                    keys_to_drop = [
+                        k for k in state_dict.keys()
+                        if "embed_tokens" in k or "lm_head" in k
+                    ]
+                    if keys_to_drop:
+                        self.logger.warning(
+                            f"Dropping {len(keys_to_drop)} keys from adapter "
+                            f"state_dict (embed_tokens / lm_head) due to size mismatch."
+                        )
+                        for k in keys_to_drop:
+                            state_dict.pop(k)
+
+                    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+                    self.logger.info(
+                        f"LoRA weights loaded. "
+                        f"Missing keys: {len(missing)}, unexpected: {len(unexpected)}"
+                    )
+
         return model
+
     
     def set_latent_token_id(self, token_id: int):
         """Set the special token ID for latent reasoning"""
@@ -180,14 +221,8 @@ class CoconutModel(nn.Module):
                     hidden_states_offset = 0
                 else:
                     # Subsequent passes - use KV cache
-                    past_key_values = [
-                        (
-                            k[:, :, :next_compute_range[0], :],
-                            v[:, :, :next_compute_range[0], :],
-                        )
-                        for k, v in kv_cache
-                    ]
-                    
+                    past_key_values = kv_cache
+
                     outputs = self.model(
                         inputs_embeds=inputs_embeds[
                             :, next_compute_range[0]:next_compute_range[1], :
@@ -252,13 +287,7 @@ class CoconutModel(nn.Module):
                 )
             
             # ✅ Step 5: Final pass with all latent tokens replaced
-            past_key_values = [
-                (
-                    k[:, :, :next_compute_range[0], :],
-                    v[:, :, :next_compute_range[0], :],
-                )
-                for k, v in kv_cache
-            ] if kv_cache else None
+            past_key_values = kv_cache
             
             outputs = self.model(
                 inputs_embeds=inputs_embeds[
@@ -329,17 +358,18 @@ def load_model_and_tokenizer(config):
     if world_size > 1:
         # NOTE: find_unused_parameters=True может быть полезен для COCONUT, 
         # но может замедлить работу. Начни без него.
-        model.model = ddp.DistributedDataParallel(
-            model.model,
+        model = ddp.DistributedDataParallel(
+            model,
             device_ids=[rank],
             output_device=rank,
-            # find_unused_parameters=True 
+            find_unused_parameters=True 
         )
         model.logger.info(f"Model wrapped in DDP on GPU {rank}.")
     
     # Set latent token ID
     latent_token_id = tokenizer.convert_tokens_to_ids('<thought>')
-    model.set_latent_token_id(latent_token_id)
+    model_to_configure = model.module if world_size > 1 else model
+    model_to_configure.set_latent_token_id(latent_token_id)
     
     logger.info("Model and tokenizer loaded successfully")
     return model, tokenizer

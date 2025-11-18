@@ -24,12 +24,14 @@ model:
     target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
     lora_dropout: 0.05
 
+  resume_from_checkpoint: "outputs/stage_2/step_6000"
+
 data:
   dataset_name: "SWE-bench/SWE-smith"
   split: "train"
-  max_seq_length: 4096
-  max_prompt_length: 2048
-  batch_size: 2
+  max_seq_length: 5000
+  max_prompt_length: 1500
+  batch_size: 1
   num_workers: 4
   gradient_accumulation_steps: 1
   cache_dir: "./data_cache"

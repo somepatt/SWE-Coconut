@@ -237,6 +237,9 @@ def get_cot_latent_dataset(
 
     n_additional_tokens = 0 if no_special_marker else 2
 
+    max_seq_len = configs.get("max_seq_length", 2048)
+    max_prompt_length = configs.get("max_prompt_lenght", 1024)
+
     def process_dataset(sample):
         if random.random() < configs.get("uniform_prob", 0.0):
             scheduled_stage_to_train = random.choice(
@@ -274,10 +277,8 @@ def get_cot_latent_dataset(
             ))
             + sample["answer_tokenized"]
         )
-        
-        return {
-            "input_ids": tokens,
-            "labels": (
+
+        labels = (
                 [-100] * (
                     len(sample["question_tokenized"])
                     + n_latent_tokens
@@ -287,7 +288,15 @@ def get_cot_latent_dataset(
                     n_latent_tokens + n_additional_tokens
                     + len(sample["question_tokenized"]):
                 ]
-            ),
+            )
+
+        tokens = tokens[:max_seq_len]
+        labels = tokens[:max_seq_len]
+
+        
+        return {
+            "input_ids": tokens,
+            "labels": labels,
             "attention_mask": [1] * len(tokens),
             "idx": sample["idx"],
             "position_ids": list(range(len(tokens))),

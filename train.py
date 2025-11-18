@@ -111,7 +111,7 @@ def main(config_path: str):
     logger.info(f"Всего стадий: {config.training.num_stages}")
     logger.info("=" * 80)
     
-    for stage in range(config.training.num_stages + 1):
+    for stage in range(3, config.training.num_stages + 1):
         
         # Создаем словарь конфигов, который ожидает data.py
         # Это мост между config.py и data.py
