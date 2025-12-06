@@ -1,15 +1,15 @@
 project_name: "coconut-code-llm"
-experiment_name: "swe-smith-qwen3"
-output_dir: "./outputs"
+experiment_name: "swe-smith-qwen2.5-coder-7B-Instruct"
+output_dir: "./outputs_qwen2.5-coder-7B-Instruct"
 seed: 42
 
 model:
-  name: "Qwen/Qwen3-8B"
+  name: "Qwen/Qwen2.5-Coder-7B-Instruct"
   dtype: "bfloat16"
   trust_remote_code: true
   
   # Quantization
-  use_quantization: true
+  use_quantization: false
   quantization:
     load_in_4bit: true
     bnb_4bit_quant_type: "nf4"
@@ -19,19 +19,20 @@ model:
   # LoRA
   use_lora: true
   lora:
-    r: 16
-    lora_alpha: 32
-    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
+    r: 8
+    lora_alpha: 16
+    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
     lora_dropout: 0.05
 
-  resume_from_checkpoint: "outputs/stage_2/step_6000"
+  # resume_from_checkpoint: "outputs_qwen2.5-7B-Instruct/final_model"
+  gradient_checkpointing: true
 
 data:
   dataset_name: "SWE-bench/SWE-smith"
   split: "train"
-  max_seq_length: 5000
-  max_prompt_length: 1500
-  batch_size: 1
+  max_seq_length: 4096
+  max_prompt_length: 4096
+  batch_size: 2
   num_workers: 4
   gradient_accumulation_steps: 1
   cache_dir: "./data_cache"
@@ -49,20 +50,20 @@ training:
   
   continuous_thought_steps: 2  # Кол-во латентных шагов
   
-  warmup_steps: 100
-  num_training_steps: 5000
+  warmup_steps: 200
+  num_training_steps: 10000
   logging_steps: 10
   save_steps: 500
   eval_steps: 1000
 
 optimizer:
   name: "adamw"
-  lr: 5e-5
+  lr: 1e-5
   weight_decay: 0.01
   betas: [0.9, 0.999]
   eps: 1e-8
-  max_grad_norm: 1.0
-  warmup_steps: 100
+  max_grad_norm: 10.0
+  warmup_steps: 200
 
 monitoring:
   use_wandb: false

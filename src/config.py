@@ -1,5 +1,3 @@
-# src/config.py
-
 from dataclasses import dataclass, field
 from typing import Optional, List
 import yaml
@@ -23,9 +21,9 @@ class ModelConfig(BaseModel):
 class DataConfig(BaseModel):
     dataset_name: str
     split: str = "train"
-    max_seq_length: int = 1024
-    max_prompt_length: int = 512
-    batch_size: int = 2
+    max_seq_length: int = 20000
+    max_prompt_length: int = 2000
+    batch_size: int = 1
     num_workers: int = 4
     gradient_accumulation_steps: int = 1
     cache_dir: str = "./data_cache"
@@ -34,7 +32,7 @@ class CoconutTrainingConfig(BaseModel):
     num_stages: int = 3
     epoch_per_stage: int = 1
     
-    continuous_thought_steps: int = 4
+    continuous_thought_steps: int = 2
     warmup_steps: int = 100
     num_training_steps: int = 5000
     logging_steps: int = 10
@@ -46,11 +44,11 @@ class CoconutTrainingConfig(BaseModel):
 
 class OptimizerConfig(BaseModel):
     name: str = "adamw"
-    lr: float = 5e-5
+    lr: float = 1e-6
     weight_decay: float = 0.01
     betas: tuple = (0.9, 0.999)
     eps: float = 1e-8
-    max_grad_norm: float = 1.0
+    max_grad_norm: float = 100.0
     warmup_steps: int = 100
 
 class MonitoringConfig(BaseModel):

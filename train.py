@@ -4,6 +4,7 @@ from loguru import logger
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from src.utils import setup_distributed
+from torch.utils.data import Subset
 
 # Импортируем все кастомные модули из 'src'
 try:
@@ -81,7 +82,8 @@ def main(config_path: str):
         base_train_dataset = get_dataset(
             dataset_name=config.data.dataset_name,
             split=config.data.split, # т.е. "train" из твоего DataConfig
-            tokenizer=tokenizer
+            tokenizer=tokenizer,
+            max_seq_length=config.data.max_seq_length,
             )
         # base_val_dataset = get_dataset(config.data.val_path, tokenizer) # Для валидации
     except AttributeError as e:
@@ -111,7 +113,7 @@ def main(config_path: str):
     logger.info(f"Всего стадий: {config.training.num_stages}")
     logger.info("=" * 80)
     
-    for stage in range(3, config.training.num_stages + 1):
+    for stage in range(config.training.num_stages + 1):
         
         # Создаем словарь конфигов, который ожидает data.py
         # Это мост между config.py и data.py
@@ -120,7 +122,8 @@ def main(config_path: str):
             "max_latent_stage": config.training.num_stages,
             "pad_latent_to_max": config.training.pad_latent_to_max,
             "no_cot": False,
-            "c_thought": config.training.continuous_thought_steps
+            "c_thought": config.training.continuous_thought_steps,
+            "max_seq_length": config.data.max_seq_length,
         }
         
         logger.info(f"Подготовка данных для Стадии {stage}/{config.training.num_stages}...")
@@ -194,6 +197,8 @@ def main(config_path: str):
 
 
 if __name__ == "__main__":
+    import os
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     parser = argparse.ArgumentParser(description="Запуск обучения модели COCONUT")
     parser.add_argument(
         "--config",

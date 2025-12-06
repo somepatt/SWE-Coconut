@@ -69,7 +69,8 @@ class OptimizerManager:
         # Gradient clipping
         grad_norm = torch.nn.utils.clip_grad_norm_(
             self.model.parameters(),
-            self.config.optimizer.max_grad_norm,
+            # self.config.optimizer.max_grad_norm,
+            10.0,
         )
         
         self.optimizer.step()

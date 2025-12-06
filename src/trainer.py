@@ -2,6 +2,7 @@
 import os
 import torch
 import time
+from itertools import islice
 from pathlib import Path
 from typing import Optional, Dict
 from loguru import logger
@@ -39,6 +40,7 @@ class CoconutTrainer:
             epoch_loss = 0.0
             epoch_examples = 0
             
+            # dataloader = islice(dataloader, 9000)
             pbar = tqdm(dataloader, desc=f"Stage {stage} Epoch {epoch}")
             
             for batch_idx, batch in enumerate(pbar):
@@ -66,6 +68,10 @@ class CoconutTrainer:
                     # Gradient accumulation
                     if (batch_idx + 1) % self.config.data.gradient_accumulation_steps == 0:
                         grad_norm = self.optimizer_manager.step()
+                        if grad_norm > 500:
+                            logger.warning(f"Dropping step due to huge grad_norm: {grad_norm}")
+                            self.optimizer_manager.optimizer.zero_grad()
+                            continue
                         
                         batch_loss_value = float(loss.detach().item())
                         epoch_loss += batch_loss_value
@@ -172,13 +178,16 @@ class CoconutTrainer:
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
         try:
-            # Save model
-            self.model.model.save_pretrained(str(checkpoint_dir))
+            # 🔹 1. Разворачиваем DDP, если он есть
+            model_to_save = self.model.module if hasattr(self.model, "module") else self.model
+
+            # 🔹 2. Сохраняем HF-модель (внутри CoconutModel)
+            model_to_save.model.save_pretrained(str(checkpoint_dir))
             
-            # Save tokenizer
+            # 🔹 3. Токенайзер
             self.tokenizer.save_pretrained(str(checkpoint_dir))
             
-            # Save config
+            # 🔹 4. Конфиг
             self.config.to_yaml(str(checkpoint_dir / "config.yaml"))
             
             self.logger.info(f"Checkpoint saved: {checkpoint_dir}")

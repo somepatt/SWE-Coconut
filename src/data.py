@@ -1,32 +1,60 @@
+# src/data.py
 import json
 import itertools
 import random
 from dataclasses import dataclass
 from typing import Optional, List, Dict
 import torch
-import torch.distributed as dist
 from datasets import Dataset, load_dataset 
-from transformers import PreTrainedTokenizerBase, AutoTokenizer
+from transformers import PreTrainedTokenizerBase
 from transformers.data.data_collator import pad_without_fast_tokenizer_warning
 from loguru import logger
+
+# === НОВОЕ: тот же шаблон, что и в inference_ddp.py ===
+PROMPT_TEMPLATE = """You are an autonomous software engineer tasked with fixing bugs.
+Analyze the issue and produce a minimal unified diff that resolves the failure.
+If you are unsure, still return your best attempt at a patch.
+
+Repository: {repo}
+Base commit: {base_commit}
+Instance ID: {instance_id}
+
+Problem statement:
+{problem}
+
+Provide ONLY the patch in a fenced diff block or raw unified diff.
+"""
+
+def build_train_prompt(sample: Dict) -> str:
+    """Строим ровно тот же промпт, что и при инференсе."""
+    repo = sample.get("repo") or sample.get("repo_name") or "unknown repo"
+    base_commit = sample.get("base_commit") or sample.get("base_commit_id") or "unknown"
+    problem = sample.get("problem_statement") or sample.get("prompt") or ""
+    instance_id = sample.get("instance_id") or sample.get("id") or "NA"
+
+    return PROMPT_TEMPLATE.format(
+        repo=repo,
+        base_commit=base_commit,
+        instance_id=instance_id,
+        problem=problem.strip(),
+    ).strip() + "\n"
+
 
 def get_dataset(
     dataset_name: str, 
     split: str, 
     tokenizer: PreTrainedTokenizerBase, 
-    max_size=1000000000
+    max_size: int = 20000,
+    max_seq_length: int = 8192,  # фильтр по длине (должен совпадать с конфигом)
 ) -> Dataset:
     """Load and tokenize dataset from Hugging Face"""
     
     logger.info(f"Loading dataset '{dataset_name}' split '{split}' from Hugging Face...")
 
     try:
-        # Загружаем датасет с Hugging Face
         dataset = load_dataset(dataset_name, split=split)
     except Exception as e:
         logger.error(f"Не удалось загрузить датасет '{dataset_name}': {e}")
-        logger.error("Убедись, что у тебя есть доступ к интернету и 'datasets' "
-                     "библиотека установлена (pip install datasets).")
         raise
 
     if max_size < len(dataset):
@@ -35,55 +63,82 @@ def get_dataset(
 
     def tokenize_sample(sample, idx):
         """
-        Tokenizes a sample from 'SWE-bench/SWE-smith'
-        Question = problem_statement
-        Steps (CoT) = lines from 'patch'
-        Answer = [EOS] (since 'patch' is the full output)
+        Tokenizes a sample.
         """
-        
-        # 'problem_statement' - это наш вопрос
+        # === ВАЖНО: теперь используем тот же промпт, что в inference ===
+        prompt = build_train_prompt(sample)
+
+        # question_tokenized = tokenizer.encode(
+        #     sample["problem_statement"] + "\n", add_special_tokens=True
+        # )
+        # Теперь:
         question_tokenized = tokenizer.encode(
-            sample["problem_statement"] + "\n", add_special_tokens=True
+            prompt,
+            add_special_tokens=False  # как в inference_ddp.build_inputs
         )
         
-        # 'patch' - это наши "мысли" (Chain-of-Thought), разбитые по строкам
+        # 'patch' - это наши "шаги/ответ" (патч)
         patch_lines = sample.get("patch", "").split("\n")
         steps_tokenized = [
             tokenizer.encode(line + "\n", add_special_tokens=False)
             for line in patch_lines if line.strip()
         ]
         
+        # Один EOS в конце как "конец патча"
         answer_tokenized = [tokenizer.eos_token_id]
         
         return {
             "question_tokenized": question_tokenized,
             "steps_tokenized": steps_tokenized,
             "answer_tokenized": answer_tokenized,
-            "idx": idx, # Добавляем 'idx'
+            "idx": idx,
         }
 
-    # Применяем токенизацию
+    # 1. Токенизация
     dataset = dataset.map(
         tokenize_sample,
-        with_indices=True, # Передаем 'idx' в функцию
-        remove_columns=list(dataset.features), # Удаляем старые колонки
-        num_proc=32
+        with_indices=True,
+        remove_columns=list(dataset.features),
+        num_proc=32,
+        desc="Tokenizing"
     )
 
-    logger.info(f"Dataset loaded and tokenized: {len(dataset)} samples")
+    # 2. ✅ Фильтрация по длине (с учётом нового промпта)
+    prev_len = len(dataset)
+    
+    def filter_long_samples(sample):
+        # Общее количество токенов в патче (сумма длин шагов)
+        patch_len = sum(len(step) for step in sample["steps_tokenized"])
+        
+        if patch_len > max_seq_length:
+            return False
+            
+        total_len = len(sample["question_tokenized"]) + patch_len
+        if total_len > max_seq_length:
+             return False
+             
+        return True
+
+    dataset = dataset.filter(
+        filter_long_samples,
+        num_proc=32,
+        desc="Filtering by length"
+    )
+    
+    logger.info(f"Filtered {prev_len - len(dataset)} samples exceeding {max_seq_length} tokens.")
+    logger.info(f"Dataset loaded and filtered: {len(dataset)} samples")
+    
     return dataset
 
 
 @dataclass
 class MyCollator:
     """Collate with KV cache optimization"""
-
     tokenizer: PreTrainedTokenizerBase
     latent_id: Optional[int] = None
     label_pad_token_id: Optional[int] = -100
 
     def __call__(self, features, return_tensors=None):
-        # ✅ ДОБАВЛЕНА ПРОВЕРКА: на случай пустого батча
         if not features:
             return {}
             
@@ -124,7 +179,6 @@ class MyCollator:
         
         return_tensors = "pt"
         
-        # ✅ ИСПРАВЛЕНИЕ 1: Проверяем ключи у features[0], а не у features
         label_name = "label" if "label" in features[0].keys() else "labels"
         
         non_label_position_features = [
@@ -143,7 +197,6 @@ class MyCollator:
             return_tensors=return_tensors,
         )
         
-        # ✅ ИСПРАВЛЕНИЕ 2: Проверяем ключи у features[0]
         labels = (
             [feature[label_name] for feature in features]
             if label_name in features[0].keys()
@@ -153,7 +206,6 @@ class MyCollator:
         if labels is not None and all(label is None for label in labels):
             labels = None
         
-        # ✅ ИСПРАВЛЕНИЕ 3: Проверяем ключи у features[0]
         position_ids = (
             [feature["position_ids"] for feature in features]
             if "position_ids" in features[0].keys()
@@ -179,7 +231,7 @@ class MyCollator:
         
         return batch
 
-        
+
 def get_question_latent_dataset(
     scheduled_stage,
     base_dataset,
@@ -190,7 +242,6 @@ def get_question_latent_dataset(
     no_special_marker=False,
     ):
     """Dataset for generation (evaluation)"""
-
 
     def process_dataset(sample):
         if configs.get("pad_latent_to_max", False):
@@ -223,6 +274,8 @@ def get_question_latent_dataset(
         remove_columns=list(base_dataset.features),
         num_proc=32
     )
+
+
 def get_cot_latent_dataset(
     scheduled_stage,
     base_dataset,
@@ -236,9 +289,9 @@ def get_cot_latent_dataset(
     """Dataset for training with latent tokens"""
 
     n_additional_tokens = 0 if no_special_marker else 2
-
-    max_seq_len = configs.get("max_seq_length", 2048)
-    max_prompt_length = configs.get("max_prompt_lenght", 1024)
+    
+    # Берем макс длину из конфига или дефолт 8192
+    max_seq_len = configs.get("max_seq_length", 8192)
 
     def process_dataset(sample):
         if random.random() < configs.get("uniform_prob", 0.0):
@@ -267,6 +320,7 @@ def get_cot_latent_dataset(
         
         n_latent_tokens *= configs.get("c_thought", 1)
         
+        # Собираем токены
         tokens = (
             sample["question_tokenized"]
             + ([] if no_special_marker else [start_id])
@@ -278,22 +332,23 @@ def get_cot_latent_dataset(
             + sample["answer_tokenized"]
         )
 
+        # Собираем labels (маскируем вопрос и латентные токены через -100)
         labels = (
-                [-100] * (
-                    len(sample["question_tokenized"])
-                    + n_latent_tokens
-                    + n_additional_tokens
-                )
-                + tokens[
-                    n_latent_tokens + n_additional_tokens
-                    + len(sample["question_tokenized"]):
-                ]
+            [-100] * (
+                len(sample["question_tokenized"])
+                + n_latent_tokens
+                + n_additional_tokens
             )
+            + tokens[
+                n_latent_tokens + n_additional_tokens
+                + len(sample["question_tokenized"]):
+            ]
+        )
 
+        # Обрезаем по длине
         tokens = tokens[:max_seq_len]
-        labels = tokens[:max_seq_len]
+        labels = labels[:max_seq_len]
 
-        
         return {
             "input_ids": tokens,
             "labels": labels,
