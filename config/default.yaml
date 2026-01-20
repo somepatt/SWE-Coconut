@@ -1,6 +1,6 @@
 project_name: "coconut-code-llm"
-experiment_name: "swe-smith-qwen2.5-coder-7B-Instruct"
-output_dir: "./outputs_qwen2.5-coder-7B-Instruct"
+experiment_name: "swe-smith-qwen2.5-coder-7B-Instruct_woCoT"
+output_dir: "./outputs_qwen2.5-coder-7B-Instruct_woCoT"
 seed: 42
 
 model:
@@ -9,7 +9,7 @@ model:
   trust_remote_code: true
   
   # Quantization
-  use_quantization: false
+  use_quantization: true
   quantization:
     load_in_4bit: true
     bnb_4bit_quant_type: "nf4"
@@ -24,7 +24,7 @@ model:
     target_modules: ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
     lora_dropout: 0.05
 
-  # resume_from_checkpoint: "outputs_qwen2.5-7B-Instruct/final_model"
+  resume_from_checkpoint: "outputs_qwen2.5-coder-7B-Instruct_woCoT/stage_3/step_19500"
   gradient_checkpointing: true
 
 data:
@@ -51,7 +51,7 @@ training:
   continuous_thought_steps: 2  # Кол-во латентных шагов
   
   warmup_steps: 200
-  num_training_steps: 10000
+  num_training_steps: 3000
   logging_steps: 10
   save_steps: 500
   eval_steps: 1000

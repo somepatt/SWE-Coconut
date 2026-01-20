@@ -13,6 +13,7 @@ class OptimizerManager:
         
         self.optimizer = self._create_optimizer()
         self.scheduler = self._create_scheduler()
+        self.schefuler = self._create_scheduler()
         
     def _create_optimizer(self) -> AdamW:
         """Create AdamW optimizer"""

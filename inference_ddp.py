@@ -68,7 +68,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=str,
-        default="outputs_qwen2.5-7B-Instruct/swe_bench_predictions.json",
+        default="outputs_qwen2.5-coder-7B-Instruct_woCoT/swe_bench_predictions.json",
         help="Path to the JSON file that will store predictions.",
     )
     parser.add_argument(
@@ -92,7 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--temperature",
         type=float,
-        default=0.2,
+        default=0.0,
         help="Sampling temperature (ignored when num_beams > 1).",
     )
     parser.add_argument(
