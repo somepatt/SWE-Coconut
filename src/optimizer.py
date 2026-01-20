@@ -13,6 +13,7 @@ class OptimizerManager:
         
         self.optimizer = self._create_optimizer()
         self.scheduler = self._create_scheduler()
+        self.schefuler = self._create_scheduler()
         
     def _create_optimizer(self) -> AdamW:
         """Create AdamW optimizer"""
@@ -69,7 +70,8 @@ class OptimizerManager:
         # Gradient clipping
         grad_norm = torch.nn.utils.clip_grad_norm_(
             self.model.parameters(),
-            self.config.optimizer.max_grad_norm,
+            # self.config.optimizer.max_grad_norm,
+            10.0,
         )
         
         self.optimizer.step()

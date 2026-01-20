@@ -55,10 +55,10 @@ class CoconutModel(nn.Module):
         self.logger.info(f"Model loaded: {model.config.model_type}")
         
         if self.config.model.use_quantization:
-            base_model = prepare_model_for_kbit_training(model)
+            model = prepare_model_for_kbit_training(model)
 
-        model.gradient_checkpointing_enable()
-        self.logger.info("Gradient checkpointing enabled (required for COCONUT loop)")
+        # model.gradient_checkpointing_enable()
+        # self.logger.info("Gradient checkpointing enabled (required for COCONUT loop)")
         
         adapters_path = getattr(self.config.model, "resume_from_checkpoint", None)
         
@@ -74,7 +74,7 @@ class CoconutModel(nn.Module):
                 task_type="CAUSAL_LM",
             )
 
-            model = get_peft_model(base_model, lora_config)
+            model = get_peft_model(model, lora_config)
             self.logger.info("LoRA adapters initialized.")
 
             # 4) если указан чекпоинт — подгружаем веса адаптера вручную
@@ -364,7 +364,8 @@ def load_model_and_tokenizer(config):
             output_device=rank,
             find_unused_parameters=True 
         )
-        model.logger.info(f"Model wrapped in DDP on GPU {rank}.")
+        logger.info(f"Model wrapped in DDP on GPU {rank}.")
+        # model.logger.info(f"Model wrapped in DDP on GPU {rank}.")
     
     # Set latent token ID
     latent_token_id = tokenizer.convert_tokens_to_ids('<thought>')
