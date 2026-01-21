@@ -62,8 +62,8 @@ class CoconutModel(nn.Module):
         if self.config.model.use_quantization:
             model = prepare_model_for_kbit_training(model)
 
-        # model.gradient_checkpointing_enable()
-        # self.logger.info("Gradient checkpointing enabled (required for COCONUT loop)")
+        model.gradient_checkpointing_enable()
+        self.logger.info("Gradient checkpointing enabled (required for COCONUT loop)")
         
         adapters_path = getattr(self.config.model, "resume_from_checkpoint", None)
         

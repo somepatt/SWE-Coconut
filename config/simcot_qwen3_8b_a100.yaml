@@ -30,18 +30,18 @@ data:
   split: "train"
   max_seq_length: 8192
   max_prompt_length: 4096
-  batch_size: 2
+  batch_size: 1
   num_workers: 4
-  gradient_accumulation_steps: 8
+  gradient_accumulation_steps: 4
   cache_dir: "./data_cache"
   steps_field: "steps"
   steps_pattern: null
   steps_delimiter: null
-  max_step_tokens: 256
+  max_step_tokens: 512
   require_steps: true
 
 training:
-  num_stages: 4
+  num_stages: 3
   epoch_per_stage: 1
   continuous_thought_steps: 4
   warmup_steps: 200
