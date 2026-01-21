@@ -3,3 +3,7 @@
 /sb-cli*
 README_PROMPT.md
 src/__pycache__
+*.pdf
+resolved_traj*
+*.md
+*.txt

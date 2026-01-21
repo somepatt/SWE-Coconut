@@ -27,6 +27,20 @@ class DataConfig(BaseModel):
     num_workers: int = 4
     gradient_accumulation_steps: int = 1
     cache_dir: str = "./data_cache"
+    steps_field: Optional[str] = None
+    steps_pattern: Optional[str] = None
+    steps_delimiter: Optional[str] = None
+    max_step_tokens: int = 256
+    require_steps: bool = False
+
+class DecoderConfig(BaseModel):
+    name: Optional[str] = None
+    dtype: str = "bfloat16"
+    trust_remote_code: bool = True
+    use_quantization: bool = False
+    quantization: dict = Field(default_factory=dict)
+    use_lora: bool = False
+    lora: dict = Field(default_factory=dict)
 
 class CoconutTrainingConfig(BaseModel):
     num_stages: int = 3
@@ -57,6 +71,14 @@ class MonitoringConfig(BaseModel):
     wandb_entity: Optional[str] = None
     log_model: bool = False
 
+class SimCoTConfig(BaseModel):
+    enabled: bool = False
+    lambda_step: float = 1.0
+    lambda_lm: float = 1.0
+    decoder_trainable: bool = True
+    share_embeddings: bool = True
+    decoder: DecoderConfig = Field(default_factory=DecoderConfig)
+
 class TrainingConfig(BaseModel):
     project_name: str
     experiment_name: str
@@ -68,6 +90,7 @@ class TrainingConfig(BaseModel):
     training: CoconutTrainingConfig
     optimizer: OptimizerConfig
     monitoring: MonitoringConfig
+    simcot: SimCoTConfig = Field(default_factory=SimCoTConfig)
     
     @classmethod
     def from_yaml(cls, config_path: str) -> "TrainingConfig":

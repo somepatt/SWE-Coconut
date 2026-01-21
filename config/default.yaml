@@ -36,6 +36,12 @@ data:
   num_workers: 4
   gradient_accumulation_steps: 1
   cache_dir: "./data_cache"
+  # ✅ Параметры для извлечения steps из траекторий
+  steps_field: null  # Будет использовать messages для извлечения
+  steps_pattern: null
+  steps_delimiter: null
+  max_step_tokens: 512  # ✅ Увеличено с 256 до 512 для SWE-задач
+  require_steps: false  # Можно установить в true если нужны только samples со steps
 
 training:
   # COCONUT stages
@@ -76,3 +82,33 @@ checkpoint:
   save_steps: 500
   resume_from_checkpoint: null
   load_best_model_at_end: true
+
+# ✅ ДОБАВЛЕНО: SIM-CoT конфигурация для step-level supervision
+simcot:
+  enabled: true  # Включить SIM-CoT обучение
+  lambda_step: 1.0  # Вес для step-level loss
+  lambda_lm: 1.0  # Вес для language modeling loss
+  decoder_trainable: true  # Обучать декодер
+  share_embeddings: true  # Делить embeddings между main model и decoder
+
+  decoder:
+    name: "Qwen/Qwen2.5-Coder-1.5B"  # Меньшая модель для decoder (опционально)
+    # Можно использовать ту же модель: name: null (будет использовать model.name)
+    dtype: "bfloat16"
+    trust_remote_code: true
+
+    # Quantization для decoder
+    use_quantization: true
+    quantization:
+      load_in_4bit: true
+      bnb_4bit_quant_type: "nf4"
+      bnb_4bit_compute_dtype: "bfloat16"
+      bnb_4bit_use_double_quant: true
+
+    # LoRA для decoder (легче обучать)
+    use_lora: true
+    lora:
+      r: 8
+      lora_alpha: 16
+      target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
+      lora_dropout: 0.05

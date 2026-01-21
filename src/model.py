@@ -29,6 +29,11 @@ class CoconutModel(nn.Module):
         
         # Special token IDs for latent reasoning
         self.latent_token_id = None  # Will be set after tokenizer is loaded
+
+        # Optional SIM-CoT decoder
+        self.simcot_decoder = None
+        if getattr(self.config, "simcot", None) and self.config.simcot.enabled:
+            self.simcot_decoder = self._load_simcot_decoder()
     
     def _load_model(self) -> AutoModelForCausalLM:
         """Load base model with quantization and LoRA"""
@@ -109,6 +114,69 @@ class CoconutModel(nn.Module):
 
         return model
 
+    def _load_simcot_decoder(self) -> Optional[AutoModelForCausalLM]:
+        """Load auxiliary decoder for SIM-CoT step supervision."""
+        simcot_cfg = self.config.simcot
+        decoder_cfg = simcot_cfg.decoder
+        decoder_name = decoder_cfg.name or self.config.model.name
+
+        self.logger.info(f"Loading SIM-CoT decoder: {decoder_name}")
+
+        bnb_config = None
+        if decoder_cfg.use_quantization:
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=decoder_cfg.quantization.get("load_in_4bit", True),
+                bnb_4bit_quant_type=decoder_cfg.quantization.get("bnb_4bit_quant_type", "nf4"),
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=decoder_cfg.quantization.get("bnb_4bit_use_double_quant", True),
+            )
+
+        decoder = AutoModelForCausalLM.from_pretrained(
+            decoder_name,
+            quantization_config=bnb_config,
+            device_map=None,
+            trust_remote_code=decoder_cfg.trust_remote_code,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2",
+        )
+
+        if decoder_cfg.use_quantization:
+            decoder = prepare_model_for_kbit_training(decoder)
+
+        if decoder_cfg.use_lora and decoder_cfg.lora:
+            lora_cfg = decoder_cfg.lora
+            lora_config = LoraConfig(
+                r=lora_cfg["r"],
+                lora_alpha=lora_cfg["lora_alpha"],
+                target_modules=lora_cfg["target_modules"],
+                lora_dropout=lora_cfg["lora_dropout"],
+                bias="none",
+                task_type="CAUSAL_LM",
+            )
+            decoder = get_peft_model(decoder, lora_config)
+
+        if simcot_cfg.share_embeddings:
+            try:
+                if (
+                    decoder.get_input_embeddings().weight.shape
+                    == self.embedding.weight.shape
+                ):
+                    decoder.set_input_embeddings(self.embedding)
+                    if decoder.get_output_embeddings() and self.model.get_output_embeddings():
+                        decoder.set_output_embeddings(self.model.get_output_embeddings())
+                    self.logger.info("SIM-CoT decoder embeddings tied to base model.")
+                else:
+                    self.logger.warning("SIM-CoT embedding shapes do not match; skipping tying.")
+            except Exception as exc:
+                self.logger.warning(f"SIM-CoT embedding sharing failed: {exc}")
+
+        if not simcot_cfg.decoder_trainable:
+            for param in decoder.parameters():
+                param.requires_grad = False
+            self.logger.info("SIM-CoT decoder parameters frozen.")
+
+        return decoder
+
     
     def set_latent_token_id(self, token_id: int):
         """Set the special token ID for latent reasoning"""
@@ -146,6 +214,7 @@ class CoconutModel(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
+        return_latent_embeds: bool = False,
     ) -> Dict:
         """
         ✅ COCONUT forward pass with continuous thought.
@@ -177,6 +246,8 @@ class CoconutModel(nn.Module):
         latent_lists = self._find_latent_positions(input_ids)
         max_n_latents = max([len(l) for l in latent_lists])
         
+        latent_embeds = None
+
         if max_n_latents == 0:
             # No latent reasoning, standard forward pass
             outputs = self.model(
@@ -286,6 +357,20 @@ class CoconutModel(nn.Module):
                     else next_compute_range[1] + 1
                 )
             
+            if return_latent_embeds:
+                latent_embeds = torch.zeros(
+                    batch_size,
+                    max_n_latents,
+                    inputs_embeds.size(-1),
+                    device=inputs_embeds.device,
+                    dtype=inputs_embeds.dtype,
+                )
+                for batch_idx, pos_list in enumerate(latent_lists):
+                    for latent_idx, token_pos in enumerate(pos_list):
+                        latent_embeds[batch_idx, latent_idx] = inputs_embeds[
+                            batch_idx, token_pos
+                        ]
+
             # ✅ Step 5: Final pass with all latent tokens replaced
             past_key_values = kv_cache
             
@@ -311,6 +396,7 @@ class CoconutModel(nn.Module):
         
         return {
             'logits': logits,
+            'latent_embeds': latent_embeds,
             # 'inputs_embeds': inputs_embeds,
             # 'hidden_states': outputs.hidden_states[-1] if outputs.hidden_states else None,
         }

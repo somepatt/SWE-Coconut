@@ -1,0 +1,91 @@
+project_name: "simcot-code-llm"
+experiment_name: "simcot-qwen3-8b"
+output_dir: "./outputs_simcot_qwen3_8b"
+seed: 42
+
+model:
+  name: "Qwen/Qwen3-8B"
+  dtype: "bfloat16"
+  trust_remote_code: true
+
+  use_quantization: true
+  quantization:
+    load_in_4bit: true
+    bnb_4bit_quant_type: "nf4"
+    bnb_4bit_compute_dtype: "bfloat16"
+    bnb_4bit_use_double_quant: true
+
+  use_lora: true
+  lora:
+    r: 16
+    lora_alpha: 32
+    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    lora_dropout: 0.05
+
+  resume_from_checkpoint: null
+  gradient_checkpointing: true
+
+data:
+  dataset_name: "resolved_trajectories_openai__Qwen__Qwen3-Coder-30B-A3B-Instruct.eval_default"
+  split: "train"
+  max_seq_length: 8192
+  max_prompt_length: 4096
+  batch_size: 2
+  num_workers: 4
+  gradient_accumulation_steps: 8
+  cache_dir: "./data_cache"
+  steps_field: "steps"
+  steps_pattern: null
+  steps_delimiter: null
+  max_step_tokens: 256
+  require_steps: true
+
+training:
+  num_stages: 4
+  epoch_per_stage: 1
+  continuous_thought_steps: 4
+  warmup_steps: 200
+  num_training_steps: 4000
+  logging_steps: 10
+  save_steps: 500
+  eval_steps: 1000
+  uniform_prob: 0.0
+  pad_latent_to_max: false
+
+optimizer:
+  name: "adamw"
+  lr: 2e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  max_grad_norm: 10.0
+  warmup_steps: 200
+
+monitoring:
+  use_wandb: false
+  wandb_project: "simcot-code"
+  wandb_entity: null
+  log_model: false
+
+simcot:
+  enabled: true
+  lambda_step: 1.0
+  lambda_lm: 1.0
+  decoder_trainable: true
+  share_embeddings: true
+  decoder:
+    name: "Qwen/Qwen3-8B"
+    dtype: "bfloat16"
+    trust_remote_code: true
+    use_quantization: true
+    quantization:
+      load_in_4bit: true
+      bnb_4bit_quant_type: "nf4"
+      bnb_4bit_compute_dtype: "bfloat16"
+      bnb_4bit_use_double_quant: true
+    use_lora: true
+    lora:
+      r: 8
+      lora_alpha: 16
+      target_modules: ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+      lora_dropout: 0.05

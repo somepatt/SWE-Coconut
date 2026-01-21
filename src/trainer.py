@@ -4,10 +4,11 @@ import torch
 import time
 from itertools import islice
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 from loguru import logger
 import torch.nn.functional as F
 from tqdm import tqdm
+from torch.nn.utils.rnn import pad_sequence
 
 class CoconutTrainer:
     """COCONUT trainer with multi-stage training for latent reasoning"""
@@ -18,6 +19,7 @@ class CoconutTrainer:
         self.config = config
         self.optimizer_manager = optimizer_manager
         self.logger = logger
+        self.simcot_enabled = getattr(self.config, "simcot", None) and self.config.simcot.enabled
         
         self.global_step = 0
         self.best_loss = float('inf')
@@ -141,7 +143,8 @@ class CoconutTrainer:
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            position_ids=position_ids, 
+            position_ids=position_ids,
+            return_latent_embeds=bool(self.simcot_enabled),
         )
         
         logits = outputs['logits']
@@ -156,20 +159,162 @@ class CoconutTrainer:
         # F.cross_entropy *автоматически* проигнорирует все токены, 
         # где shift_labels == -100 (это стандартное поведение).
         # Вся логика с 'shift_mask' больше не нужна.
-        loss = F.cross_entropy(
+        lm_loss = F.cross_entropy(
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1),
             ignore_index=-100 # Явно указываем (хотя это и так default)
         )
         
         # Проверяем, что loss не NaN (на всякий случай)
-        if torch.isnan(loss) or torch.isinf(loss):
+        if torch.isnan(lm_loss) or torch.isinf(lm_loss):
             self.logger.warning("NaN/Inf loss detected after F.cross_entropy")
             return torch.tensor(0.0, device=input_ids.device, requires_grad=True)
 
+        total_loss = lm_loss * getattr(self.config.simcot, "lambda_lm", 1.0)
+
+        if self.simcot_enabled and batch.get("steps_tokenized"):
+            step_loss = self._compute_simcot_loss(
+                latent_embeds=outputs.get("latent_embeds"),
+                steps_tokenized=batch["steps_tokenized"],
+            )
+            if step_loss is not None:
+                total_loss = total_loss + step_loss * getattr(
+                    self.config.simcot, "lambda_step", 1.0
+                )
+
         # ✅ 5. Нормализуем loss
-        loss = loss / self.config.data.gradient_accumulation_steps
+        total_loss = total_loss / self.config.data.gradient_accumulation_steps
         
+        return total_loss
+
+    def _get_simcot_decoder(self):
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        return getattr(model, "simcot_decoder", None)
+
+    def _bucket_steps(self, steps_tokenized, num_latents: int):
+        """
+        Распределяет steps по buckets для latent токенов.
+
+        ✅ ИСПРАВЛЕНО: Обрабатывает случай когда steps < latents
+        используя циклическое повторение шагов.
+        """
+        if num_latents <= 0:
+            return []
+        if not steps_tokenized:
+            return [[] for _ in range(num_latents)]
+
+        num_steps = len(steps_tokenized)
+        buckets = []
+
+        # ✅ Если шагов меньше чем latents - циклически повторяем шаги
+        if num_steps < num_latents:
+            for idx in range(num_latents):
+                step_idx = idx % num_steps  # Циклическое повторение
+                merged: List[int] = list(steps_tokenized[step_idx])
+                if self.config.data.max_step_tokens:
+                    merged = merged[: self.config.data.max_step_tokens]
+                buckets.append(merged)
+        else:
+            # Обычный bucketing: распределяем шаги по buckets
+            for idx in range(num_latents):
+                start = int(idx * num_steps / num_latents)
+                end = int((idx + 1) * num_steps / num_latents)
+                merged: List[int] = []
+                for step in steps_tokenized[start:end]:
+                    merged.extend(step)
+                if self.config.data.max_step_tokens:
+                    merged = merged[: self.config.data.max_step_tokens]
+                buckets.append(merged)
+        return buckets
+
+    def _compute_simcot_loss(self, latent_embeds, steps_tokenized):
+        decoder = self._get_simcot_decoder()
+        if decoder is None or latent_embeds is None:
+            return None
+
+        batch_size, num_latents, _ = latent_embeds.shape
+        eos_id = self.tokenizer.eos_token_id
+        embedder = decoder.get_input_embeddings()
+        vocab_size = embedder.weight.size(0)
+        device = latent_embeds.device
+
+        sequences = []
+        labels = []
+        seq_lens = []
+
+        for batch_idx in range(batch_size):
+            buckets = self._bucket_steps(steps_tokenized[batch_idx], num_latents)
+            for latent_idx in range(num_latents):
+                step_tokens = buckets[latent_idx]
+                if not step_tokens:
+                    continue
+
+                # ✅ УЛУЧШЕНО: Дополнительная проверка на invalid токены
+                # (основная фильтрация уже в get_dataset, но на всякий случай)
+                valid_tokens = [t for t in step_tokens if 0 <= t < vocab_size]
+                if not valid_tokens:
+                    self.logger.warning(
+                        f"Skipping step with all invalid tokens at batch {batch_idx}, "
+                        f"latent {latent_idx}"
+                    )
+                    continue
+
+                if eos_id is not None:
+                    valid_tokens = valid_tokens + [eos_id]
+
+                step_ids = torch.tensor(valid_tokens, device=device, dtype=torch.long)
+                step_embeds = embedder(step_ids)
+                latent_vec = latent_embeds[batch_idx, latent_idx].unsqueeze(0)
+
+                input_embeds = torch.cat([latent_vec, step_embeds], dim=0)
+                label_ids = torch.tensor(
+                    [-100] + valid_tokens, device=device, dtype=torch.long
+                )
+
+                sequences.append(input_embeds)
+                labels.append(label_ids)
+                seq_lens.append(input_embeds.size(0))
+
+        if not sequences:
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
+        input_embeds_padded = pad_sequence(
+            sequences, batch_first=True, padding_value=0.0
+        )
+        labels_padded = pad_sequence(labels, batch_first=True, padding_value=-100)
+        max_len = input_embeds_padded.size(1)
+
+        attention_mask = torch.zeros(
+            (len(sequences), max_len), device=device, dtype=torch.long
+        )
+        for idx, seq_len in enumerate(seq_lens):
+            attention_mask[idx, :seq_len] = 1
+
+        position_ids = torch.arange(max_len, device=device).unsqueeze(0).expand(
+            len(sequences), -1
+        )
+
+        outputs = decoder(
+            inputs_embeds=input_embeds_padded,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            return_dict=True,
+        )
+        logits = outputs.logits
+
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels_padded[:, 1:].contiguous()
+
+        loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=-100,
+        )
+
+        if torch.isnan(loss) or torch.isinf(loss):
+            self.logger.warning("NaN/Inf SIM-CoT loss detected.")
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
         return loss
         
     def _save_checkpoint(self, stage: int, step: int):

@@ -84,6 +84,11 @@ def main(config_path: str):
             split=config.data.split, # т.е. "train" из твоего DataConfig
             tokenizer=tokenizer,
             max_seq_length=config.data.max_seq_length,
+            steps_field=config.data.steps_field,
+            steps_pattern=config.data.steps_pattern,
+            steps_delimiter=config.data.steps_delimiter,
+            max_step_tokens=config.data.max_step_tokens,
+            require_steps=config.data.require_steps,
             )
         # base_val_dataset = get_dataset(config.data.val_path, tokenizer) # Для валидации
     except AttributeError as e:
@@ -140,13 +145,14 @@ def main(config_path: str):
             shuffle=False
         )
 
+        # ✅ ИСПРАВЛЕНО: sampler должен быть для train_dataset, а не base_train_dataset
         sampler = DistributedSampler(
-            base_train_dataset, 
-            num_replicas=world_size, 
-            rank=rank, 
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
             shuffle=True
         )
-        
+
         # Создаем DataLoader для этой стадии
         train_loader = DataLoader(
             train_dataset,
