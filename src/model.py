@@ -215,19 +215,21 @@ class CoconutModel(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         return_latent_embeds: bool = False,
+        simcot_step_ids: Optional[List[torch.Tensor]] = None,
     ) -> Dict:
         """
         ✅ COCONUT forward pass with continuous thought.
-        
+
         Args:
             input_ids: [batch, seq_len]
             attention_mask: [batch, seq_len]
             position_ids: [batch, seq_len]
             labels: [batch, seq_len]
-            stage: Training stage (determines how many latent tokens to use)
-        
+            return_latent_embeds: Whether to return latent embeddings
+            simcot_step_ids: List of step token tensors for SIM-CoT loss (per batch item)
+
         Returns:
-            Dict with logits, loss, and reasoning trajectory
+            Dict with logits, latent_embeds, and optionally simcot_loss
         """
         
         batch_size, seq_len = input_ids.shape
@@ -394,18 +396,116 @@ class CoconutModel(nn.Module):
             logits = torch.cat(all_logits, dim=1)  # [batch, seq_len, vocab_size]
         
         
-        return {
+        result = {
             'logits': logits,
             'latent_embeds': latent_embeds,
-            # 'inputs_embeds': inputs_embeds,
-            # 'hidden_states': outputs.hidden_states[-1] if outputs.hidden_states else None,
         }
+
+        # Compute SIM-CoT loss inside forward() for DDP compatibility
+        if self.simcot_decoder is not None and latent_embeds is not None and simcot_step_ids is not None:
+            simcot_loss = self._compute_simcot_loss_internal(latent_embeds, simcot_step_ids)
+            result['simcot_loss'] = simcot_loss
+
+        return result
     
+    def _compute_simcot_loss_internal(
+        self,
+        latent_embeds: torch.Tensor,
+        simcot_step_ids: List[List[List[int]]]
+    ) -> torch.Tensor:
+        """
+        Compute SIM-CoT auxiliary loss inside forward() for DDP compatibility.
+
+        Args:
+            latent_embeds: [batch, num_latents, hidden_size]
+            simcot_step_ids: List[batch][num_latents] of token id lists
+
+        Returns:
+            SIM-CoT loss tensor
+        """
+        from torch.nn.utils.rnn import pad_sequence
+
+        batch_size, num_latents, hidden_dim = latent_embeds.shape
+        device = latent_embeds.device
+
+        embedder = self.simcot_decoder.get_input_embeddings()
+        vocab_size = embedder.weight.size(0)
+
+        sequences = []
+        labels_list = []
+        seq_lens = []
+
+        for batch_idx in range(batch_size):
+            step_lists = simcot_step_ids[batch_idx] if batch_idx < len(simcot_step_ids) else []
+            for latent_idx in range(num_latents):
+                if latent_idx >= len(step_lists):
+                    continue
+                step_tokens = step_lists[latent_idx]
+                if not step_tokens:
+                    continue
+
+                # Filter invalid tokens
+                valid_tokens = [t for t in step_tokens if 0 <= t < vocab_size]
+                if not valid_tokens:
+                    continue
+
+                step_ids = torch.tensor(valid_tokens, device=device, dtype=torch.long)
+                step_embeds = embedder(step_ids)
+                latent_vec = latent_embeds[batch_idx, latent_idx].unsqueeze(0)
+
+                input_embeds = torch.cat([latent_vec, step_embeds], dim=0)
+                label_ids = torch.tensor(
+                    [-100] + valid_tokens, device=device, dtype=torch.long
+                )
+
+                sequences.append(input_embeds)
+                labels_list.append(label_ids)
+                seq_lens.append(input_embeds.size(0))
+
+        if not sequences:
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
+        input_embeds_padded = pad_sequence(sequences, batch_first=True, padding_value=0.0)
+        labels_padded = pad_sequence(labels_list, batch_first=True, padding_value=-100)
+        max_len = input_embeds_padded.size(1)
+
+        attention_mask = torch.zeros(
+            (len(sequences), max_len), device=device, dtype=torch.long
+        )
+        for idx, seq_len in enumerate(seq_lens):
+            attention_mask[idx, :seq_len] = 1
+
+        position_ids = torch.arange(max_len, device=device).unsqueeze(0).expand(
+            len(sequences), -1
+        )
+
+        outputs = self.simcot_decoder(
+            inputs_embeds=input_embeds_padded,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            return_dict=True,
+        )
+        logits = outputs.logits
+
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels_padded[:, 1:].contiguous()
+
+        loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=-100,
+        )
+
+        if torch.isnan(loss) or torch.isinf(loss):
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
+        return loss
+
     def get_trainable_params(self):
         """Get trainable parameters"""
         total = sum(p.numel() for p in self.parameters())
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        
+
         self.logger.info(f"Total params: {total:,}, Trainable: {trainable:,}")
         return trainable, total
 
@@ -442,15 +542,16 @@ def load_model_and_tokenizer(config):
     model = model.to(device)
 
     if world_size > 1:
-        # NOTE: find_unused_parameters=True может быть полезен для COCONUT, 
-        # но может замедлить работу. Начни без него.
+        # NOTE: static_graph=True нужен для SIM-CoT, так как decoder
+        # вызывается вне forward() в trainer._compute_simcot_loss()
         model = ddp.DistributedDataParallel(
             model,
             device_ids=[rank],
             output_device=rank,
-            find_unused_parameters=True 
+            find_unused_parameters=True,
+            static_graph=True,
         )
-        logger.info(f"Model wrapped in DDP on GPU {rank}.")
+        logger.info(f"Model wrapped in DDP on GPU {rank} with static_graph=True.")
         # model.logger.info(f"Model wrapped in DDP on GPU {rank}.")
     
     # Set latent token ID

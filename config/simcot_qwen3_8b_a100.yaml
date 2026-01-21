@@ -4,7 +4,7 @@ output_dir: "./outputs_simcot_qwen3_8b"
 seed: 42
 
 model:
-  name: "Qwen/Qwen3-8B"
+  name: "Qwen/Qwen3-0.6B"
   dtype: "bfloat16"
   trust_remote_code: true
 
@@ -17,8 +17,8 @@ model:
 
   use_lora: true
   lora:
-    r: 16
-    lora_alpha: 32
+    r: 8
+    lora_alpha: 16
     target_modules: ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
     lora_dropout: 0.05
 
@@ -30,7 +30,7 @@ data:
   split: "train"
   max_seq_length: 8192
   max_prompt_length: 4096
-  batch_size: 1
+  batch_size: 2
   num_workers: 4
   gradient_accumulation_steps: 4
   cache_dir: "./data_cache"
@@ -74,7 +74,7 @@ simcot:
   decoder_trainable: true
   share_embeddings: true
   decoder:
-    name: "Qwen/Qwen3-8B"
+    name: "Qwen/Qwen3-0.6B"
     dtype: "bfloat16"
     trust_remote_code: true
     use_quantization: true
@@ -85,7 +85,7 @@ simcot:
       bnb_4bit_use_double_quant: true
     use_lora: true
     lora:
-      r: 8
-      lora_alpha: 16
+      r: 4
+      lora_alpha: 8
       target_modules: ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
       lora_dropout: 0.05

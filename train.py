@@ -209,7 +209,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--config",
         type=str,
-        default="config/default.yaml",
+        default="config/simcot_qwen3_8b_a100.yaml",
         help="Путь к YAML-файлу конфигурации обучения."
     )
     

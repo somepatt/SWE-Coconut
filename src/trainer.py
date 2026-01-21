@@ -132,64 +132,82 @@ class CoconutTrainer:
     
     def _compute_loss(self, batch: Dict, stage: int) -> torch.Tensor:
         """Compute COCONUT loss with stage-aware latent reasoning"""
-        
-        # 1. Получаем 'labels' из батча, а не 'loss_mask'
+
         input_ids = batch['input_ids']
         attention_mask = batch['attention_mask']
-        labels = batch['labels'] 
-        position_ids = batch.get('position_ids', None) # .get для безопасности
+        labels = batch['labels']
+        position_ids = batch.get('position_ids', None)
 
-        # ✅ 2. Делаем forward pass
+        # Prepare SIM-CoT step IDs for forward pass (DDP-compatible)
+        simcot_step_ids = None
+        if self.simcot_enabled and batch.get("steps_tokenized"):
+            simcot_step_ids = self._prepare_simcot_step_ids(
+                batch["steps_tokenized"],
+                num_latents=self._count_latents(input_ids),
+            )
+
+        # Forward pass with SIM-CoT computed inside model
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             return_latent_embeds=bool(self.simcot_enabled),
+            simcot_step_ids=simcot_step_ids,
         )
-        
+
         logits = outputs['logits']
-        
-        # ✅ 3. Сдвигаем logits и labels для "next token prediction"
-        # Logits: (batch, seq_len, vocab_size) -> (batch, seq_len-1, vocab_size)
-        # Labels: (batch, seq_len) -> (batch, seq_len-1)
+
+        # Next token prediction loss
         shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous() # Используем 'labels', а не 'input_ids'
-        
-        # ✅ 4. Считаем loss
-        # F.cross_entropy *автоматически* проигнорирует все токены, 
-        # где shift_labels == -100 (это стандартное поведение).
-        # Вся логика с 'shift_mask' больше не нужна.
+        shift_labels = labels[..., 1:].contiguous()
+
         lm_loss = F.cross_entropy(
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1),
-            ignore_index=-100 # Явно указываем (хотя это и так default)
+            ignore_index=-100
         )
-        
-        # Проверяем, что loss не NaN (на всякий случай)
+
         if torch.isnan(lm_loss) or torch.isinf(lm_loss):
             self.logger.warning("NaN/Inf loss detected after F.cross_entropy")
             return torch.tensor(0.0, device=input_ids.device, requires_grad=True)
 
         total_loss = lm_loss * getattr(self.config.simcot, "lambda_lm", 1.0)
 
-        if self.simcot_enabled and batch.get("steps_tokenized"):
-            step_loss = self._compute_simcot_loss(
-                latent_embeds=outputs.get("latent_embeds"),
-                steps_tokenized=batch["steps_tokenized"],
+        # Add SIM-CoT loss if computed in forward
+        if 'simcot_loss' in outputs and outputs['simcot_loss'] is not None:
+            simcot_loss = outputs['simcot_loss']
+            total_loss = total_loss + simcot_loss * getattr(
+                self.config.simcot, "lambda_step", 1.0
             )
-            if step_loss is not None:
-                total_loss = total_loss + step_loss * getattr(
-                    self.config.simcot, "lambda_step", 1.0
-                )
 
-        # ✅ 5. Нормализуем loss
         total_loss = total_loss / self.config.data.gradient_accumulation_steps
-        
+
         return total_loss
 
-    def _get_simcot_decoder(self):
-        model = self.model.module if hasattr(self.model, "module") else self.model
-        return getattr(model, "simcot_decoder", None)
+    def _count_latents(self, input_ids: torch.Tensor) -> int:
+        """Count max number of latent tokens in batch"""
+        model_inner = self.model.module if hasattr(self.model, "module") else self.model
+        latent_token_id = model_inner.latent_token_id
+        if latent_token_id is None:
+            return 0
+        counts = (input_ids == latent_token_id).sum(dim=1)
+        return int(counts.max().item())
+
+    def _prepare_simcot_step_ids(
+        self,
+        steps_tokenized,
+        num_latents: int
+    ) -> list:
+        """
+        Prepare step IDs for SIM-CoT loss, bucketed by latent tokens.
+        Returns: List[batch][num_latents] of token id lists
+        """
+        batch_size = len(steps_tokenized)
+        result = []
+        for batch_idx in range(batch_size):
+            buckets = self._bucket_steps(steps_tokenized[batch_idx], num_latents)
+            result.append(buckets)
+        return result
 
     def _bucket_steps(self, steps_tokenized, num_latents: int):
         """
@@ -227,96 +245,6 @@ class CoconutTrainer:
                 buckets.append(merged)
         return buckets
 
-    def _compute_simcot_loss(self, latent_embeds, steps_tokenized):
-        decoder = self._get_simcot_decoder()
-        if decoder is None or latent_embeds is None:
-            return None
-
-        batch_size, num_latents, _ = latent_embeds.shape
-        eos_id = self.tokenizer.eos_token_id
-        embedder = decoder.get_input_embeddings()
-        vocab_size = embedder.weight.size(0)
-        device = latent_embeds.device
-
-        sequences = []
-        labels = []
-        seq_lens = []
-
-        for batch_idx in range(batch_size):
-            buckets = self._bucket_steps(steps_tokenized[batch_idx], num_latents)
-            for latent_idx in range(num_latents):
-                step_tokens = buckets[latent_idx]
-                if not step_tokens:
-                    continue
-
-                # ✅ УЛУЧШЕНО: Дополнительная проверка на invalid токены
-                # (основная фильтрация уже в get_dataset, но на всякий случай)
-                valid_tokens = [t for t in step_tokens if 0 <= t < vocab_size]
-                if not valid_tokens:
-                    self.logger.warning(
-                        f"Skipping step with all invalid tokens at batch {batch_idx}, "
-                        f"latent {latent_idx}"
-                    )
-                    continue
-
-                if eos_id is not None:
-                    valid_tokens = valid_tokens + [eos_id]
-
-                step_ids = torch.tensor(valid_tokens, device=device, dtype=torch.long)
-                step_embeds = embedder(step_ids)
-                latent_vec = latent_embeds[batch_idx, latent_idx].unsqueeze(0)
-
-                input_embeds = torch.cat([latent_vec, step_embeds], dim=0)
-                label_ids = torch.tensor(
-                    [-100] + valid_tokens, device=device, dtype=torch.long
-                )
-
-                sequences.append(input_embeds)
-                labels.append(label_ids)
-                seq_lens.append(input_embeds.size(0))
-
-        if not sequences:
-            return torch.tensor(0.0, device=device, requires_grad=True)
-
-        input_embeds_padded = pad_sequence(
-            sequences, batch_first=True, padding_value=0.0
-        )
-        labels_padded = pad_sequence(labels, batch_first=True, padding_value=-100)
-        max_len = input_embeds_padded.size(1)
-
-        attention_mask = torch.zeros(
-            (len(sequences), max_len), device=device, dtype=torch.long
-        )
-        for idx, seq_len in enumerate(seq_lens):
-            attention_mask[idx, :seq_len] = 1
-
-        position_ids = torch.arange(max_len, device=device).unsqueeze(0).expand(
-            len(sequences), -1
-        )
-
-        outputs = decoder(
-            inputs_embeds=input_embeds_padded,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            return_dict=True,
-        )
-        logits = outputs.logits
-
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = labels_padded[:, 1:].contiguous()
-
-        loss = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
-            ignore_index=-100,
-        )
-
-        if torch.isnan(loss) or torch.isinf(loss):
-            self.logger.warning("NaN/Inf SIM-CoT loss detected.")
-            return torch.tensor(0.0, device=device, requires_grad=True)
-
-        return loss
-        
     def _save_checkpoint(self, stage: int, step: int):
         """Save model checkpoint"""
         checkpoint_dir = Path(self.config.output_dir) / f"stage_{stage}" / f"step_{step}"
