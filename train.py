@@ -118,7 +118,7 @@ def main(config_path: str):
     logger.info(f"Всего стадий: {config.training.num_stages}")
     logger.info("=" * 80)
     
-    for stage in range(2, config.training.num_stages + 1):
+    for stage in range(1, config.training.num_stages + 1):
         
         # Создаем словарь конфигов, который ожидает data.py
         # Это мост между config.py и data.py
@@ -187,16 +187,19 @@ def main(config_path: str):
         try:
             final_save_dir = Path(config.output_dir) / "final_model"
             final_save_dir.mkdir(parents=True, exist_ok=True)
-            
+
+            # Получаем базовую модель (если обернута в DDP, извлекаем через .module)
+            base_model = model.module.model if hasattr(model, 'module') else model.model
+
             # Сохраняем базовую модель (Peft или обычную)
-            model.model.save_pretrained(str(final_save_dir))
-            
+            base_model.save_pretrained(str(final_save_dir))
+
             # Сохраняем токенайзер
             tokenizer.save_pretrained(str(final_save_dir))
-            
+
             # Сохраняем конфиг, с которым модель обучалась
             config.to_yaml(str(final_save_dir / "config.yaml"))
-            
+
             logger.info(f"Финальная модель сохранена в: {final_save_dir}")
         except Exception as e:
             logger.error(f"Ошибка при сохранении финальной модели: {e}")
